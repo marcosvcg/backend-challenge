@@ -31,3 +31,15 @@ export class InvalidReferenceKindError extends Error {
     this.name = 'InvalidReferenceKindError';
   }
 }
+
+/** Seção 7 regra 4 do README: uma referência não pode ser revertida duas vezes
+ *  pelo mesmo tipo de operação (REFUND ou ROLLBACK). Espelha o índice único
+ *  parcial wt_reference_reversal_unique — checado explicitamente na aplicação
+ *  para produzir este failureCode de negócio; a constraint do banco é a defesa
+ *  final contra race (ARCHITECTURE.md seção 9). */
+export class DuplicateReversalError extends Error {
+  constructor(referenceTransactionId: string, kind: string) {
+    super(`Reference "${referenceTransactionId}" was already reversed by a processed "${kind}".`);
+    this.name = 'DuplicateReversalError';
+  }
+}

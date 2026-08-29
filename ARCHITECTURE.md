@@ -560,6 +560,8 @@ O lock é adquirido nesta chamada e permanece ativo até o `COMMIT`/`ROLLBACK` d
 
 ## 13. Fluxo end-to-end de `ProcessWagerTransactionUseCase` (fechado — última decisão pré-código)
 
+> Revisado após 4 correções de consistência (ver changelog ao final da seção): (1) `Wallet` não conhece `WagerTransactionKind` — quem decide débito/crédito é a lógica de wagering, que chama `wallet.debit()`/`wallet.credit()` diretamente; (2) finalização do Inbox centralizada num único ponto de saída, para nunca deixar `processed_at = NULL` num commit; (3) `PENDING_REFERENCE` é ACKable no transporte SQS mas **não é terminal** no domínio; (4) `WagerTransaction.create()` sempre nasce `PENDING`, e `markPendingReference()` transiciona e agenda o primeiro retry.
+
 ### Borda HTTP vs SQS (única diferença permitida)
 
 ```
@@ -573,12 +575,15 @@ SQS Consumer:
   1. Recebe mensagem, extrai messageId e data (idempotencyKey já vem no payload)
   2. Monta ProcessWagerTransactionCommand { ..., origin: 'queue', messageId, consumerName, idempotencyKey }
   3. Chama useCase.execute(command)
-  4. Resultado business/terminal → ACK
-     Resultado transient ou permanent → não faz ACK (visibility timeout expira → redelivery →
+  4. result.ackable === true  → ACK (cobre: processado, rejeitado, PENDING_REFERENCE persistido,
+                                  conflito de idempotência, replay de redelivery já processada)
+     result.ackable === false → não faz ACK (visibility timeout expira → redelivery →
        após maxReceiveCount, redrive policy da fila move para DLQ — único mecanismo de DLQ, sem publish manual)
 ```
 
 A regra de negócio nunca se duplica entre as duas bordas — a diferença é só o que cada uma faz *antes* de chamar o use case e *depois* do retorno.
+
+**Nomenclatura — `ackable` (transporte) ≠ `isTerminal()` (domínio):** um resultado é `ackable` quando o SQS pode confirmar a mensagem com segurança, porque a decisão sobre o que fazer a seguir já não é mais responsabilidade do redelivery da fila. Isso inclui `PENDING_REFERENCE`, que é `ackable = true` mas **não terminal** no domínio (`WagerTransaction.isTerminal()` continua `false` para ela) — o reprocessamento dessa transação passa a ser responsabilidade do worker agendado (seção 7.1 do README), não do SQS. Os dois conceitos vivem em objetos diferentes: `ackable` é propriedade de `ProcessWagerTransactionResult` (transporte/aplicação); `isTerminal()` é propriedade de `WagerTransaction` (domínio).
 
 ### Pseudocódigo do use case
 
@@ -586,54 +591,84 @@ A regra de negócio nunca se duplica entre as duas bordas — a diferença é s�
 async execute(cmd: ProcessWagerTransactionCommand): Promise<ProcessWagerTransactionResult> {
   return this.runner.run(async (uow) => {
 
-    // 1. INBOX — só quando origin === 'queue'
+    // 1. INBOX — só quando origin === 'queue'. Guarda se este processo reivindicou
+    //    a mensagem agora, para decidir no ÚNICO ponto de saída se marca processed_at.
+    let inboxClaimed = false;
     if (cmd.origin === 'queue') {
       const claim = await uow.inbox.tryClaim(cmd.consumerName, cmd.messageId, cmd.payloadHash);
       if (!claim.isNew) {
         if (claim.payloadHashMatches) {
-          return ProcessWagerTransactionResult.alreadyAcked(); // redelivery legítima, nada a reprocessar
+          return finish(ProcessWagerTransactionResult.alreadyAcked()); // redelivery legítima
         }
-        return ProcessWagerTransactionResult.permanentError('INBOX_PAYLOAD_MISMATCH');
+        return finish(ProcessWagerTransactionResult.permanentError('INBOX_PAYLOAD_MISMATCH'));
       }
+      inboxClaimed = true;
     }
 
     // 2. IDEMPOTÊNCIA (idempotencyKey) — vale para HTTP e SQS igualmente
     const existing = await uow.wagerTransaction.findByIdempotencyKey(cmd.idempotencyKey);
     if (existing) {
       if (existing.payloadHash !== cmd.payloadHash) {
-        // Terminal, mas NÃO é veredito de negócio: nenhuma WagerTransaction nova é criada,
-        // nenhum evento de domínio publicado. Conflito de protocolo de idempotência.
+        // NÃO é veredito de negócio: nenhuma WagerTransaction nova é criada, nenhum
+        // evento de domínio publicado. Conflito de protocolo de idempotência.
         // HTTP: 409. SQS: ACK (reprocessar não mudaria o resultado).
-        return ProcessWagerTransactionResult.idempotencyConflict(cmd.idempotencyKey);
+        return finish(ProcessWagerTransactionResult.idempotencyConflict(cmd.idempotencyKey));
       }
-      return ProcessWagerTransactionResult.replay(existing); // resultado original, incl. saldo observado
+      return finish(ProcessWagerTransactionResult.replay(existing)); // resultado original, incl. saldo observado
     }
 
     // 3. RESOLVER REFERÊNCIA (REFUND/ROLLBACK obrigatório; WIN opcional)
+    //    WagerTransaction.create() SEMPRE nasce PENDING (seção 6.3 do README).
     let referenceTransaction: WagerTransaction | undefined;
+    let transaction = WagerTransaction.create(cmd); // status = PENDING
+
     if (cmd.referenceExternalTransactionId) {
       referenceTransaction = await uow.wagerTransaction.findByProviderAndExternalId(
         cmd.providerId, cmd.referenceExternalTransactionId,
       );
       const referenceRequired = cmd.kind === 'REFUND' || cmd.kind === 'ROLLBACK';
       if (!referenceTransaction && referenceRequired) {
-        const pending = WagerTransaction.create({ ...cmd, status: 'PENDING_REFERENCE' });
-        await uow.wagerTransaction.save(pending);
-        await uow.outbox.enqueue(WagerTransactionPendingReference.from(pending));
-        if (cmd.origin === 'queue') await uow.inbox.markProcessed(cmd.consumerName, cmd.messageId);
-        return ProcessWagerTransactionResult.pendingReference(pending); // business/terminal → ACK
+        // Transiciona PENDING → PENDING_REFERENCE; o próprio método calcula e
+        // preenche next_reference_retry_at (constraint wt_next_retry_coherence exige isso).
+        transaction.markPendingReference();
+        await uow.wagerTransaction.save(transaction);
+        await uow.outbox.enqueue(WagerTransactionPendingReference.from(transaction));
+        // ACKable (reprocessamento agora é do worker), mas NÃO terminal no domínio.
+        return finish(ProcessWagerTransactionResult.pendingReference(transaction));
       }
     }
 
     // 4. LOCK NA WALLET — único ponto de leitura no write path (findByIdForUpdate)
     const wallet = await uow.wallet.findByIdForUpdate(cmd.walletId);
 
-    // 5. REGRA DE NEGÓCIO — delegada ao domínio, em memória, sem I/O
-    const outcome = wallet.applyWagerTransaction({ kind: cmd.kind, money: cmd.money, reference: referenceTransaction });
-    // outcome: 'processed-with-ledger' | 'processed-no-ledger' (LOSS) | 'rejected' (com failureCode)
+    // 5. REGRA DE NEGÓCIO — decidida pela lógica de WAGERING (não pela Wallet).
+    //    Wallet não conhece BET/WIN/LOSS/REFUND/ROLLBACK — só sabe debitar/creditar
+    //    e produzir o WalletLedgerEntry correspondente. Quem decide QUAL operação
+    //    chamar, e SE ela move saldo, é esta camada, olhando cmd.kind.
+    let outcome: WagerOutcome;
+    try {
+      if (transactionMovesDebit(cmd.kind)) {
+        const { wallet: updatedWallet, ledgerEntry } = wallet.debit(cmd.money);
+        transaction.markProcessed(referenceTransaction?.id, now());
+        outcome = { wallet: updatedWallet, ledgerEntry, transaction };
+      } else if (transactionMovesCredit(cmd.kind)) {
+        const { wallet: updatedWallet, ledgerEntry } = wallet.credit(cmd.money);
+        transaction.markProcessed(referenceTransaction?.id, now());
+        outcome = { wallet: updatedWallet, ledgerEntry, transaction };
+      } else {
+        // LOSS: não move saldo, não gera ledger — apenas registra o resultado.
+        transaction.markProcessed(referenceTransaction?.id, now());
+        outcome = { wallet, ledgerEntry: undefined, transaction };
+      }
+    } catch (err) {
+      // InsufficientBalanceError, DuplicateReversalError etc. — Wallet lança,
+      // wagering traduz para REJECTED com o failureCode apropriado.
+      transaction.reject(failureCodeFor(err));
+      outcome = { wallet, ledgerEntry: undefined, transaction };
+    }
 
     // 6. PERSISTE conforme o outcome
-    if (outcome.kind === 'processed-with-ledger') {
+    if (outcome.ledgerEntry) {
       await uow.wallet.saveWithLedger(outcome.wallet, outcome.ledgerEntry);
     }
     await uow.wagerTransaction.save(outcome.transaction); // já com result_balance_* preenchido
@@ -641,30 +676,62 @@ async execute(cmd: ProcessWagerTransactionCommand): Promise<ProcessWagerTransact
     // 7. OUTBOX — sempre, para qualquer veredito terminal
     await uow.outbox.enqueue(buildEventFor(outcome));
 
-    // 8. INBOX — marca processada (mesma transação)
-    if (cmd.origin === 'queue') await uow.inbox.markProcessed(cmd.consumerName, cmd.messageId);
+    return finish(ProcessWagerTransactionResult.from(outcome)); // ackable = true
 
-    return ProcessWagerTransactionResult.from(outcome); // business/terminal → ACK
+    // --- único ponto de saída: centraliza a finalização do Inbox ---
+    async function finish(result: ProcessWagerTransactionResult): Promise<ProcessWagerTransactionResult> {
+      if (inboxClaimed) {
+        await uow.inbox.markProcessed(cmd.consumerName, cmd.messageId);
+      }
+      return result;
+    }
   });
   // exceções não capturadas acima (infra: timeout, deadlock, erro de validação de schema)
   // propagam como transient ou permanent — ver classificação abaixo — e nunca fazem ACK
+  // (o rollback da transação desfaz também o tryClaim do Inbox, então não há risco de
+  // processed_at = NULL sobreviver a um commit)
 }
 ```
 
-Todas as 9 etapas ocorrem dentro do **mesmo** `runner.run()` — um único commit ou rollback total (seção 3).
+Todas as etapas ocorrem dentro do **mesmo** `runner.run()` — um único commit ou rollback total (seção 3). A função interna `finish()` é o **único** lugar que chama `inbox.markProcessed()` — nenhum `return` do use case ocorre fora dela, o que torna esquecer a finalização do Inbox estruturalmente difícil, não apenas uma convenção a lembrar em cada ramo.
 
 ### Classificação de erros — três categorias, dois comportamentos de transporte
 
-| Classificação | Exemplos | Transporte SQS |
-|---|---|---|
-| **Business/terminal** | `PROCESSED`, `REJECTED` (saldo insuficiente, reversão duplicada), `PENDING_REFERENCE` persistido, conflito de idempotência (payload divergente) | **ACK** — decisão definitiva já commitada (ou, no conflito de idempotência, não há negócio a commitar, mas a decisão é definitiva) |
-| **Transient** | Timeout de conexão com Postgres, deadlock detectado, erro de infraestrutura recuperável | **Não ACK** → visibility timeout expira → redelivery |
-| **Permanent** | Payload malformado, `INBOX_PAYLOAD_MISMATCH`, erro de validação de schema | **Não ACK** → mesmo caminho do transient |
+| Classificação | Exemplos | `ackable` | Transporte SQS |
+|---|---|---|---|
+| **Business/handled** | `PROCESSED`, `REJECTED` (saldo insuficiente, reversão duplicada), `PENDING_REFERENCE` persistido (não-terminal no domínio, mas handled no transporte), conflito de idempotência (payload divergente), replay de redelivery já processada | `true` | **ACK** — decisão já commitada, ou não há nada a commitar mas a decisão é definitiva para o transporte |
+| **Transient** | Timeout de conexão com Postgres, deadlock detectado, erro de infraestrutura recuperável | `false` | **Não ACK** → visibility timeout expira → redelivery |
+| **Permanent** | Payload malformado, `INBOX_PAYLOAD_MISMATCH`, erro de validação de schema | `false` | **Não ACK** → mesmo caminho do transient |
 
-**Decisão deliberada de simplicidade:** transient e permanent seguem o **mesmo** caminho de transporte (não-ACK) — não há publicação manual em DLQ. Um único mecanismo operacional (`maxReceiveCount` + redrive policy da fila SQS) promove para a DLQ após esgotar as tentativas, para ambas as categorias. A distinção conceitual entre as três classificações é mantida apenas para **logs estruturados e métricas** (seção 12 — diagnóstico de por que uma mensagem foi parar na DLQ), não para criar um segundo caminho de código.
+**Decisão deliberada de simplicidade:** transient e permanent seguem o **mesmo** caminho de transporte (não-ACK). Um único mecanismo operacional (`maxReceiveCount` + redrive policy da fila SQS) promove para a DLQ após esgotar as tentativas, para ambas as categorias. A distinção conceitual é mantida apenas para **logs estruturados e métricas**, não para criar um segundo caminho de código.
 
-**Conflito de idempotência não é uma `WagerTransaction REJECTED`:** é detectado antes de qualquer criação de linha em `wager_transaction` — nenhum ledger, nenhum evento de domínio publicado. É terminal por ser um conflito de protocolo (mesma key, payload diferente nunca vai convergir com retry), não um veredito de regra de negócio do wagering.
-- Estratégia de concorrência para hot wallet (pessimistic vs optimistic) — Grupo B/11 do README.
-- Idempotência HTTP (payloadHash, canonical JSON) — Grupo E.
-- Autenticação (implementar ou documentar como ponto de extensão) — Grupo F.
-- Observabilidade, testes, diferenciais — Grupos G/H/I.
+**Conflito de idempotência não é uma `WagerTransaction REJECTED`:** é detectado antes de qualquer criação de linha em `wager_transaction` — nenhum ledger, nenhum evento de domínio publicado. É `ackable` por ser um conflito de protocolo (mesma key, payload diferente nunca vai convergir com retry), não um veredito de regra de negócio do wagering.
+
+### Changelog desta seção (correções de consistência pré-implementação)
+
+1. **Removido `wallet.applyWagerTransaction(kind, ...)`.** `Wallet` não deve conhecer `WagerTransactionKind` — isso vazaria conceito de wagering para dentro do agregado de wallet. A lógica de wagering (etapa 5) decide, a partir de `cmd.kind`, se chama `wallet.debit(money)`, `wallet.credit(money)`, ou nenhum dos dois (LOSS). `Wallet` continua responsável apenas pelas invariantes financeiras (saldo não-negativo, moeda igual) e por produzir o `WalletLedgerEntry` consistente.
+2. **Finalização do Inbox centralizada em `finish()`.** Antes, cada `return` antecipado (replay, conflito de idempotência) precisava lembrar de chamar `inbox.markProcessed()` individualmente — risco real de esquecer um ramo e commitar uma linha de Inbox com `processed_at = NULL`. Agora só existe um caminho de saída, que sempre decide a finalização a partir de `inboxClaimed`.
+3. **`PENDING_REFERENCE` é `ackable`, não terminal.** Antes descrito ambiguamente como "business/terminal". Corrigido: é ACKable no transporte SQS (o worker agendado assume o reprocessamento), mas `WagerTransaction.isTerminal()` continua `false` para esse status — ela pode transicionar depois.
+4. **`WagerTransaction.create()` sempre nasce `PENDING`.** A transição para `PENDING_REFERENCE` acontece via `markPendingReference()`, chamado explicitamente depois de constatar que a referência não existe — esse método é quem calcula e preenche `next_reference_retry_at`, nunca `create()` diretamente.
+
+---
+
+## 14. `Money.equals()` — assimetria deliberada com `add`/`subtract`/`isLessThan`
+
+**Decisão:** `Money.equals(other)` retorna `false` quando as moedas diferem, em vez de lançar `CurrencyMismatchError`. Todas as demais operações binárias (`add`, `subtract`, `isLessThan`) continuam lançando o erro quando as moedas não coincidem.
+
+**Por quê:** comparar por igualdade entre moedas diferentes é uma pergunta válida com resposta óbvia — dois valores de moedas diferentes nunca são iguais, isso não é uma tentativa inválida de misturar valores (diferente de somar/subtrair, que só faz sentido semântico entre valores da mesma moeda). Forçar `equals()` a lançar exigiria que todo chamador checasse a moeda manualmente antes de qualquer comparação, sem ganho de segurança real.
+
+**Implementação:** `src/wallet/domain/money.ts` — `equals()` compara `currency` e `value` diretamente, sem passar por `assertSameCurrency()` (usado apenas por `add`, `subtract`, `isLessThan`).
+
+---
+
+## 15. `WagerBalanceEffect` — vocabulário próprio de wagering, não `LedgerDirection`
+
+**Decisão:** `WagerTransaction` nunca importa `LedgerDirection` (que pertence exclusivamente a `wallet/domain`). Em vez disso, expõe `WagerBalanceEffect` (`DEBIT | CREDIT | NONE`), um enum próprio de `wagering/domain`. A camada de aplicação (ainda não implementada) traduz: `Debit → wallet.debit(...)`, `Credit → wallet.credit(...)`, `None → nenhuma chamada`.
+
+**Por quê:** `wagering/domain` importar `LedgerDirection` de `wallet/domain` violaria na prática o boundary de módulos fechado na seção 1 — mesmo sendo um enum puro sem I/O, a regra de comunicação entre módulos existe para impedir acoplamento direto entre domínios de negócio distintos. Criar um `shared/domain/ledger-direction.ts` só para acomodar esse uso também foi descartado — moveria um conceito que pertence genuinamente à wallet só para satisfazer um consumidor externo, sem necessidade real de reuso por um terceiro módulo.
+
+**Implementação:** `src/wagering/domain/wager-balance-effect.ts`. O método que devolve esse efeito chama-se `balanceEffectFor(reference?: WagerTransaction)` — nomeado assim (não `ledgerDirectionFor`, nome do esqueleto original do README) porque o tipo de retorno é `WagerBalanceEffect`, não `LedgerDirection`; manter o nome antigo teria sido uma inconsistência semântica.
+
+**`ROLLBACK` não tem efeito próprio — inverte o da referência, com guarda explícita de kind válido:** `ROLLBACK` só pode reverter `BET`, `WIN` ou `REFUND` (seção 7 regra 3 do README). `balanceEffectFor()` valida isso explicitamente (`VALID_ROLLBACK_REFERENCE_KINDS`) e lança `InvalidReferenceKindError` se a referência for de outro kind (`ROLLBACK`, `LOSS` ou `OPENING`) — essa invariante não depende de nenhuma validação externa ter sido feita corretamente antes; é auto-contida na própria entidade.

@@ -8,6 +8,7 @@ import { FakeOutboxRepository } from './__fakes__/fake-outbox.repository';
 import { FakeTransactionRunner } from './__fakes__/fake-transaction-runner';
 import { FakeIdGenerator } from './__fakes__/fake-id-generator';
 import { FakeClock } from './__fakes__/fake-clock';
+import { DEFAULT_REFERENCE_RETRY_POLICY } from './reference-retry-policy';
 import { Wallet } from '../../wallet/domain/wallet';
 import { Money } from '../../wallet/domain/money';
 import { WagerTransactionKind } from '../domain/wager-transaction-kind';
@@ -32,7 +33,7 @@ function setUp(initialBalance = '100.00') {
   }
   walletRepo.seed(wallet);
 
-  const useCase = new ProcessWagerTransactionUseCase(runner, ids, clock);
+  const useCase = new ProcessWagerTransactionUseCase(runner, ids, clock, DEFAULT_REFERENCE_RETRY_POLICY);
 
   return { walletRepo, wagerRepo, inboxRepo, outboxRepo, runner, ids, clock, useCase };
 }
@@ -290,7 +291,12 @@ describe('ProcessWagerTransactionUseCase — atomicity proof (rollback)', () => 
     };
 
     const runner = new FakeTransactionRunner(walletRepo, wagerRepo, inboxRepo, outboxRepo);
-    const useCase = new ProcessWagerTransactionUseCase(runner, new FakeIdGenerator(), new FakeClock(AT));
+    const useCase = new ProcessWagerTransactionUseCase(
+      runner,
+      new FakeIdGenerator(),
+      new FakeClock(AT),
+      DEFAULT_REFERENCE_RETRY_POLICY,
+    );
 
     const wallet = Wallet.open({ id: WALLET_ID, playerId: PLAYER_ID, currency: 'BRL', at: AT });
     wallet.credit(Money.from({ amount: '100.00', currency: 'BRL' }), 'tx-opening', 'entry-opening', AT);

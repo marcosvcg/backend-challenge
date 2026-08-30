@@ -43,3 +43,17 @@ export class DuplicateReversalError extends Error {
     this.name = 'DuplicateReversalError';
   }
 }
+
+/** Seção 7 regra 2 do README: a referência resolvida deve pertencer ao mesmo
+ *  provider, player, wallet, moeda e rodada; regra 5: o valor de REFUND/ROLLBACK
+ *  deve ser igual ao valor da referência (reversão parcial fora de escopo).
+ *  Compartilhado entre o fluxo normal (referência já resolvida na primeira
+ *  tentativa) e o worker de PENDING_REFERENCE (referência resolvida depois) —
+ *  uma referência incompatível é sempre um erro de negócio, nunca uma
+ *  diferença de tratamento entre os dois caminhos. */
+export class IncompatibleReferenceError extends Error {
+  constructor(reason: string) {
+    super(`Reference is incompatible with this transaction: ${reason}.`);
+    this.name = 'IncompatibleReferenceError';
+  }
+}

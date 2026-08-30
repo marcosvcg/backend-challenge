@@ -4,6 +4,7 @@ import { WagerTransactionStatus } from './wager-transaction-status';
 import { WagerBalanceEffect } from './wager-balance-effect';
 import { FailureCode } from './failure-code';
 import {
+  IncompatibleReferenceError,
   InvalidReferenceKindError,
   InvalidTransactionStateError,
   MissingReferenceError,
@@ -19,6 +20,9 @@ const VALID_ROLLBACK_REFERENCE_KINDS = new Set([
   WagerTransactionKind.Win,
   WagerTransactionKind.Refund,
 ]);
+
+/** REFUND só referencia BET (seção 7 regra 3 do README — mais restrito que ROLLBACK). */
+const VALID_REFUND_REFERENCE_KINDS = new Set([WagerTransactionKind.Bet]);
 
 export interface CreateWagerTransactionProps {
   id: string;
@@ -139,6 +143,11 @@ export class WagerTransaction {
     return this._resultBalance;
   }
 
+  /** Número TOTAL de tentativas de resolução de referência já realizadas,
+   *  incluindo a tentativa inicial que levou a PENDING_REFERENCE (markPendingReference
+   *  sempre incrementa, mesmo na primeira chamada) — nunca um contador de
+   *  retries adicionais além dela. maxAttempts (ReferenceRetryPolicy) é
+   *  comparado diretamente contra este valor. */
   get referenceRetryAttempts(): number {
     return this._referenceRetryAttempts;
   }
@@ -225,6 +234,44 @@ export class WagerTransaction {
           ? WagerBalanceEffect.Credit
           : WagerBalanceEffect.Debit;
       }
+    }
+  }
+
+  /** Seção 7 regras 2, 3 e 5 do README — validado uma única vez, reusado tanto
+   *  pelo fluxo normal (referência já resolvida na primeira tentativa) quanto
+   *  pelo worker de PENDING_REFERENCE (referência resolvida depois). Cobre o
+   *  que balanceEffectFor() não cobre: identidade (provider/player/wallet/
+   *  moeda/rodada), status PROCESSED, valor exato, e REFUND→BET (mais
+   *  restrito que a checagem de kind do ROLLBACK, já feita em
+   *  balanceEffectFor). Só chamado quando há uma referência de fato a validar
+   *  (REFUND/ROLLBACK sempre; WIN apenas se optou por referenciar). */
+  assertCompatibleReference(reference: WagerTransaction): void {
+    if (reference.status !== WagerTransactionStatus.Processed) {
+      throw new IncompatibleReferenceError(`reference must be PROCESSED, was "${reference.status}"`);
+    }
+    if (reference.providerId !== this.providerId) {
+      throw new IncompatibleReferenceError('reference belongs to a different provider');
+    }
+    if (reference.playerId !== this.playerId) {
+      throw new IncompatibleReferenceError('reference belongs to a different player');
+    }
+    if (reference.walletId !== this.walletId) {
+      throw new IncompatibleReferenceError('reference belongs to a different wallet');
+    }
+    if (reference.money.currency !== this.money.currency) {
+      throw new IncompatibleReferenceError('reference has a different currency');
+    }
+    if (reference.roundId !== this.roundId) {
+      throw new IncompatibleReferenceError('reference belongs to a different round');
+    }
+    if (this.kind === WagerTransactionKind.Refund && !VALID_REFUND_REFERENCE_KINDS.has(reference.kind)) {
+      throw new IncompatibleReferenceError(`REFUND cannot reference a transaction of kind "${reference.kind}"`);
+    }
+    if (
+      (this.kind === WagerTransactionKind.Refund || this.kind === WagerTransactionKind.Rollback) &&
+      !this.money.equals(reference.money)
+    ) {
+      throw new IncompatibleReferenceError('amount must equal the reference amount exactly (partial reversal is out of scope)');
     }
   }
 

@@ -7,6 +7,7 @@ import { WageringTransactionRunner, WageringUnitOfWork } from '../../application
 import { ProcessWagerTransactionCommand } from '../../application/process-wager-transaction.command';
 import { UuidIdGenerator } from '../../../shared/__test-support__/uuid-id-generator';
 import { FakeClock } from '../../application/__fakes__/fake-clock';
+import { DEFAULT_REFERENCE_RETRY_POLICY } from '../../application/reference-retry-policy';
 import { Wallet } from '../../../wallet/domain/wallet';
 import { Money } from '../../../wallet/domain/money';
 import { WagerTransactionKind } from '../../domain/wager-transaction-kind';
@@ -76,7 +77,7 @@ describe('ProcessWagerTransactionUseCase — integration (real Postgres, real Mi
 
   function newUseCase(): ProcessWagerTransactionUseCase {
     const runner = new MikroOrmTransactionRunner(orm.em);
-    return new ProcessWagerTransactionUseCase(runner, new UuidIdGenerator(), new FakeClock(AT));
+    return new ProcessWagerTransactionUseCase(runner, new UuidIdGenerator(), new FakeClock(AT), DEFAULT_REFERENCE_RETRY_POLICY);
   }
 
   it('processes a BET end-to-end: debits wallet, creates ledger, persists wager_transaction, enqueues 2 outbox rows', async () => {
@@ -116,7 +117,7 @@ describe('ProcessWagerTransactionUseCase — integration (real Postgres, real Mi
         }),
     };
 
-    const useCase = new ProcessWagerTransactionUseCase(brokenRunner, new UuidIdGenerator(), new FakeClock(AT));
+    const useCase = new ProcessWagerTransactionUseCase(brokenRunner, new UuidIdGenerator(), new FakeClock(AT), DEFAULT_REFERENCE_RETRY_POLICY);
 
     await expect(useCase.execute(betCommand())).rejects.toThrow('Simulated crash');
 
@@ -135,8 +136,8 @@ describe('ProcessWagerTransactionUseCase — integration (real Postgres, real Mi
 
     const runnerA = new MikroOrmTransactionRunner(orm.em.fork());
     const runnerB = new MikroOrmTransactionRunner(orm.em.fork());
-    const useCaseA = new ProcessWagerTransactionUseCase(runnerA, new UuidIdGenerator(), new FakeClock(AT));
-    const useCaseB = new ProcessWagerTransactionUseCase(runnerB, new UuidIdGenerator(), new FakeClock(AT));
+    const useCaseA = new ProcessWagerTransactionUseCase(runnerA, new UuidIdGenerator(), new FakeClock(AT), DEFAULT_REFERENCE_RETRY_POLICY);
+    const useCaseB = new ProcessWagerTransactionUseCase(runnerB, new UuidIdGenerator(), new FakeClock(AT), DEFAULT_REFERENCE_RETRY_POLICY);
 
     const [resultA, resultB] = await Promise.all([
       useCaseA.execute(betCommand({ externalTransactionId: 'ext-A', idempotencyKey: 'provider-a:ext-A' })),
@@ -154,5 +155,31 @@ describe('ProcessWagerTransactionUseCase — integration (real Postgres, real Mi
       .getConnection()
       .execute(`select count(*)::int as count from wallet_ledger_entry where wallet_id = '${WALLET_ID}' and direction = 'DEBIT'`);
     expect(ledgerCount[0].count).toBe(1); // exactly one debit ledger entry — no retry duplicated it
+  });
+
+  it('rejects a REFUND whose reference is incompatible (different roundId) even when resolved on the first attempt', async () => {
+    await seedWallet(orm, '100.00');
+    const useCase = newUseCase();
+
+    const bet = await useCase.execute(
+      betCommand({ externalTransactionId: 'ext-bet', idempotencyKey: 'provider-a:ext-bet', roundId: 'round-1' }),
+    );
+    expect(bet.kind).toBe('processed');
+
+    const refund = await useCase.execute(
+      betCommand({
+        kind: WagerTransactionKind.Refund,
+        externalTransactionId: 'ext-refund',
+        idempotencyKey: 'provider-a:ext-refund',
+        referenceExternalTransactionId: 'ext-bet',
+        roundId: 'round-DIFFERENT', // incompatible with the referenced BET's round
+      }),
+    );
+
+    expect(refund.kind).toBe('rejected');
+    expect(refund.transaction?.failureCode).toBe('IncompatibleReferenceError');
+
+    const walletRow = await orm.em.fork().findOneOrFail(WalletRow, { id: WALLET_ID });
+    expect(walletRow.balanceAmount).toBe('20.00'); // unchanged by the rejected refund — only the BET's debit applied
   });
 });

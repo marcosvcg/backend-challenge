@@ -4,6 +4,7 @@ import { WagerTransactionKind } from './wager-transaction-kind';
 import { WagerTransactionStatus } from './wager-transaction-status';
 import { WagerBalanceEffect } from './wager-balance-effect';
 import {
+  IncompatibleReferenceError,
   InvalidReferenceKindError,
   InvalidTransactionStateError,
   MissingReferenceError,
@@ -306,5 +307,98 @@ describe('WagerTransaction.rehydrate', () => {
     expect(tx.status).toBe(WagerTransactionStatus.PendingReference);
     expect(tx.referenceRetryAttempts).toBe(3);
     expect(tx.nextReferenceRetryAt).toEqual(new Date('2026-01-01T01:00:00.000Z'));
+  });
+});
+
+describe('WagerTransaction.assertCompatibleReference — README seção 7 regras 2, 3, 5', () => {
+  function processedBet(overrides: Partial<CreateWagerTransactionProps> = {}): WagerTransaction {
+    const bet = WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Bet, ...overrides }));
+    bet.markProcessed(undefined, Money.from({ amount: '75.00', currency: 'BRL' }), AT);
+    return bet;
+  }
+
+  it('accepts a fully compatible reference (same provider/player/wallet/currency/round, PROCESSED, amount equal)', () => {
+    const bet = processedBet();
+    const refund = WagerTransaction.create(
+      baseProps({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'ext-0' }),
+    );
+    expect(() => refund.assertCompatibleReference(bet)).not.toThrow();
+  });
+
+  it('rejects a reference that is not PROCESSED', () => {
+    const pendingBet = WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Bet }));
+    const refund = WagerTransaction.create(
+      baseProps({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'ext-0' }),
+    );
+    expect(() => refund.assertCompatibleReference(pendingBet)).toThrow(IncompatibleReferenceError);
+  });
+
+  it('rejects a reference from a different provider', () => {
+    const bet = processedBet({ providerId: 'provider-b' });
+    const refund = WagerTransaction.create(
+      baseProps({ providerId: 'provider-a', kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'ext-0' }),
+    );
+    expect(() => refund.assertCompatibleReference(bet)).toThrow(IncompatibleReferenceError);
+  });
+
+  it('rejects a reference from a different player', () => {
+    const bet = processedBet({ playerId: 'player-b' });
+    const refund = WagerTransaction.create(
+      baseProps({ playerId: 'player-a', kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'ext-0' }),
+    );
+    expect(() => refund.assertCompatibleReference(bet)).toThrow(IncompatibleReferenceError);
+  });
+
+  it('rejects a reference from a different wallet', () => {
+    const bet = processedBet({ walletId: 'wallet-b' });
+    const refund = WagerTransaction.create(
+      baseProps({ walletId: 'wallet-a', kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'ext-0' }),
+    );
+    expect(() => refund.assertCompatibleReference(bet)).toThrow(IncompatibleReferenceError);
+  });
+
+  it('rejects a reference with a different currency', () => {
+    const bet = processedBet({ money: Money.from({ amount: '25.00', currency: 'USD' }) });
+    const refund = WagerTransaction.create(
+      baseProps({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'ext-0' }),
+    );
+    expect(() => refund.assertCompatibleReference(bet)).toThrow(IncompatibleReferenceError);
+  });
+
+  it('rejects a reference from a different round', () => {
+    const bet = processedBet({ roundId: 'round-b' });
+    const refund = WagerTransaction.create(
+      baseProps({ roundId: 'round-a', kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'ext-0' }),
+    );
+    expect(() => refund.assertCompatibleReference(bet)).toThrow(IncompatibleReferenceError);
+  });
+
+  it('rejects REFUND referencing a WIN (REFUND only references BET, stricter than ROLLBACK)', () => {
+    const win = WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Win }));
+    win.markProcessed(undefined, Money.from({ amount: '100.00', currency: 'BRL' }), AT);
+    const refund = WagerTransaction.create(
+      baseProps({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'ext-0' }),
+    );
+    expect(() => refund.assertCompatibleReference(win)).toThrow(IncompatibleReferenceError);
+  });
+
+  it('rejects REFUND with an amount different from the reference (partial reversal out of scope)', () => {
+    const bet = processedBet({ money: Money.from({ amount: '80.00', currency: 'BRL' }) });
+    const refund = WagerTransaction.create(
+      baseProps({
+        kind: WagerTransactionKind.Refund,
+        referenceExternalTransactionId: 'ext-0',
+        money: Money.from({ amount: '30.00', currency: 'BRL' }),
+      }),
+    );
+    expect(() => refund.assertCompatibleReference(bet)).toThrow(IncompatibleReferenceError);
+  });
+
+  it('accepts ROLLBACK referencing a processed WIN with equal amount', () => {
+    const win = processedBet({ kind: WagerTransactionKind.Win });
+    const rollback = WagerTransaction.create(
+      baseProps({ kind: WagerTransactionKind.Rollback, referenceExternalTransactionId: 'ext-0' }),
+    );
+    expect(() => rollback.assertCompatibleReference(win)).not.toThrow();
   });
 });

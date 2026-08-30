@@ -5,6 +5,14 @@ import { WagerTransactionStatus } from '../../domain/wager-transaction-status';
 import { Money } from '../../../wallet/domain/money';
 import { WagerTransactionRow } from './wager-transaction.row';
 
+/** Linhas hidratadas via em.findOne/em.find trazem coluna nullable ausente
+ *  como `undefined`; linhas vindas de QueryBuilder.execute('all') (raw, sem
+ *  hidratação de entidade — usado por claimBatch) trazem a mesma coluna como
+ *  `null`. Este helper trata as duas fontes de forma idêntica. */
+function isAbsent(value: unknown): value is null | undefined {
+  return value === null || value === undefined;
+}
+
 export function wagerTransactionRowToDomain(row: WagerTransactionRow): WagerTransaction {
   const state: WagerTransactionState = {
     id: row.id,
@@ -21,16 +29,16 @@ export function wagerTransactionRowToDomain(row: WagerTransactionRow): WagerTran
     createdAt: row.createdAt,
     status: row.status as WagerTransactionStatus,
     referenceRetryAttempts: row.referenceRetryAttempts,
-    ...(row.referenceExternalTransactionId !== undefined
+    ...(!isAbsent(row.referenceExternalTransactionId)
       ? { referenceExternalTransactionId: row.referenceExternalTransactionId }
       : {}),
-    ...(row.referenceTransactionId !== undefined ? { referenceTransactionId: row.referenceTransactionId } : {}),
-    ...(row.failureCode !== undefined ? { failureCode: row.failureCode } : {}),
-    ...(row.processedAt !== undefined ? { processedAt: row.processedAt } : {}),
-    ...(row.resultBalanceAmount !== undefined && row.resultBalanceCurrency !== undefined
+    ...(!isAbsent(row.referenceTransactionId) ? { referenceTransactionId: row.referenceTransactionId } : {}),
+    ...(!isAbsent(row.failureCode) ? { failureCode: row.failureCode } : {}),
+    ...(!isAbsent(row.processedAt) ? { processedAt: row.processedAt } : {}),
+    ...(!isAbsent(row.resultBalanceAmount) && !isAbsent(row.resultBalanceCurrency)
       ? { resultBalance: Money.from({ amount: row.resultBalanceAmount, currency: row.resultBalanceCurrency }) }
       : {}),
-    ...(row.nextReferenceRetryAt !== undefined ? { nextReferenceRetryAt: row.nextReferenceRetryAt } : {}),
+    ...(!isAbsent(row.nextReferenceRetryAt) ? { nextReferenceRetryAt: row.nextReferenceRetryAt } : {}),
   };
 
   return WagerTransaction.rehydrate(state);

@@ -9,6 +9,7 @@ import { ProcessWagerTransactionUseCase } from '../../application/process-wager-
 import { MikroOrmTransactionRunner } from '../mikro-orm-transaction-runner';
 import { UuidIdGenerator } from '../../../shared/__test-support__/uuid-id-generator';
 import { FakeClock } from '../../application/__fakes__/fake-clock';
+import { DEFAULT_REFERENCE_RETRY_POLICY } from '../../application/reference-retry-policy';
 import { Wallet } from '../../../wallet/domain/wallet';
 import { Money } from '../../../wallet/domain/money';
 import { WalletRow } from '../../../wallet/infrastructure/persistence/wallet.row';
@@ -111,7 +112,12 @@ describe('WagerTransactionConsumer — integration (real Postgres + real LocalSt
 
   function newConsumer(): WagerTransactionConsumer {
     const runner = new MikroOrmTransactionRunner(orm.em);
-    const useCase = new ProcessWagerTransactionUseCase(runner, new UuidIdGenerator(), new FakeClock(AT));
+    const useCase = new ProcessWagerTransactionUseCase(
+      runner,
+      new UuidIdGenerator(),
+      new FakeClock(AT),
+      DEFAULT_REFERENCE_RETRY_POLICY,
+    );
     // waitTimeSeconds = 1: mantém stop() rápido e determinístico nos testes —
     // produção/dev usa o default de 10s (ver wager-transaction.consumer.ts).
     return new WagerTransactionConsumer(sqsClient(), queueUrl, useCase, silentLogger(), 1);

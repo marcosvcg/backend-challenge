@@ -137,11 +137,13 @@ export class ProcessWagerTransactionUseCase {
         transaction.reject(err.name, wallet.balance);
       }
 
-      // 6. PERSISTE conforme o outcome
+      // 6. PERSISTE conforme o outcome — wager_transaction PRIMEIRO: o ledger
+      // entry tem FK para wager_transaction.id (ARCHITECTURE.md seção 8), então
+      // inverter esta ordem viola a FK mesmo dentro da mesma transação.
+      await uow.wagerTransaction.save(transaction);
       if (ledgerEntry) {
         await uow.wallet.saveWithLedger(wallet, ledgerEntry);
       }
-      await uow.wagerTransaction.save(transaction);
 
       // 7. OUTBOX — sempre, para qualquer veredito terminal
       await uow.outbox.enqueue(this.buildOutcomeEvent(transaction, cmd));

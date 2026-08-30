@@ -13,10 +13,5 @@ export default defineConfig({
     path: './src/migrations',
     glob: '!(*.d).{js,ts}',
   },
-  // Nenhum *.schema.ts existe ainda neste incremento de setup (as entidades reais
-  // chegam no próximo incremento). Sem isso, o MetadataDiscovery falha o bootstrap
-  // por não encontrar nenhuma entidade — remover esta linha assim que o primeiro
-  // schema (wallet) for criado.
-  discovery: { warnWhenNoEntities: false, requireEntitiesArray: false },
   debug: false,
 });

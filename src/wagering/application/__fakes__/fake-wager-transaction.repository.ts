@@ -31,7 +31,11 @@ export class FakeWagerTransactionRepository implements WagerTransactionRepositor
     );
   }
 
-  async save(transaction: WagerTransaction): Promise<void> {
+  async create(transaction: WagerTransaction): Promise<void> {
+    this.staged.set(transaction.id, transaction);
+  }
+
+  async update(transaction: WagerTransaction): Promise<void> {
     this.staged.set(transaction.id, transaction);
   }
 

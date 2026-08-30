@@ -9,7 +9,7 @@ import { DuplicateReversalError, InvalidReferenceKindError } from '../domain/wag
 import { WalletBalanceChanged } from '../../wallet/domain/wallet-balance-changed';
 import { WalletLedgerEntry } from '../../wallet/domain/wallet-ledger-entry';
 import { InsufficientBalanceError } from '../../wallet/domain/wallet.errors';
-import { TransactionRunner } from './ports/unit-of-work';
+import { WageringTransactionRunner } from './ports/unit-of-work';
 import { ProcessWagerTransactionCommand } from './process-wager-transaction.command';
 import { ProcessWagerTransactionResult } from './process-wager-transaction.result';
 import { IdGenerator } from '../../shared/application/id-generator';
@@ -30,7 +30,7 @@ const INITIAL_REFERENCE_RETRY_DELAY_MS = 30_000;
 
 export class ProcessWagerTransactionUseCase {
   constructor(
-    private readonly runner: TransactionRunner,
+    private readonly runner: WageringTransactionRunner,
     private readonly ids: IdGenerator,
     private readonly clock: Clock,
   ) {}
@@ -97,7 +97,7 @@ export class ProcessWagerTransactionUseCase {
         if (!referenceTransaction && transaction.requiresReference()) {
           const nextRetryAt = new Date(this.clock.now().getTime() + INITIAL_REFERENCE_RETRY_DELAY_MS);
           transaction.markPendingReference(nextRetryAt);
-          await uow.wagerTransaction.save(transaction);
+          await uow.wagerTransaction.create(transaction);
           await uow.outbox.enqueue(this.buildPendingReferenceEvent(transaction, cmd));
           return finish(ProcessWagerTransactionResult.pendingReference(transaction));
         }
@@ -140,7 +140,10 @@ export class ProcessWagerTransactionUseCase {
       // 6. PERSISTE conforme o outcome — wager_transaction PRIMEIRO: o ledger
       // entry tem FK para wager_transaction.id (ARCHITECTURE.md seção 8), então
       // inverter esta ordem viola a FK mesmo dentro da mesma transação.
-      await uow.wagerTransaction.save(transaction);
+      // create(), não update(): esta é a primeira persistência desta transação
+      // neste fluxo — o único caminho que já a teria persistido (PENDING_REFERENCE,
+      // acima) já retornou antes de chegar aqui.
+      await uow.wagerTransaction.create(transaction);
       if (ledgerEntry) {
         await uow.wallet.saveWithLedger(wallet, ledgerEntry);
       }

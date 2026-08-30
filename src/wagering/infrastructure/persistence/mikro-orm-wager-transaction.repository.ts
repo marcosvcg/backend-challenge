@@ -4,7 +4,11 @@ import { WagerTransaction } from '../../domain/wager-transaction';
 import { WagerTransactionKind } from '../../domain/wager-transaction-kind';
 import { WagerTransactionStatus } from '../../domain/wager-transaction-status';
 import { WagerTransactionRow } from './wager-transaction.row';
-import { wagerTransactionDomainToRow, wagerTransactionRowToDomain } from './wager-transaction.mapper';
+import {
+  wagerTransactionDomainToRow,
+  wagerTransactionDomainToUpdatePayload,
+  wagerTransactionRowToDomain,
+} from './wager-transaction.mapper';
 
 /** Construído sempre com o EntityManager "forked" da transação corrente. */
 export class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
@@ -36,16 +40,14 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
     return count > 0;
   }
 
-  async save(transaction: WagerTransaction): Promise<void> {
-    const row = wagerTransactionDomainToRow(transaction);
-    const existing = await this.em.findOne(WagerTransactionRow, { id: transaction.id });
+  async create(transaction: WagerTransaction): Promise<void> {
+    this.em.create(WagerTransactionRow, wagerTransactionDomainToRow(transaction));
+    await this.em.flush();
+  }
 
-    if (existing) {
-      this.em.assign(existing, row);
-    } else {
-      this.em.create(WagerTransactionRow, row);
-    }
-
+  async update(transaction: WagerTransaction): Promise<void> {
+    const existing = await this.em.findOneOrFail(WagerTransactionRow, { id: transaction.id });
+    this.em.assign(existing, wagerTransactionDomainToUpdatePayload(transaction));
     await this.em.flush();
   }
 }

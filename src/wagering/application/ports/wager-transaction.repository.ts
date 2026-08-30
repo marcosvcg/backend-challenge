@@ -12,5 +12,13 @@ export interface WagerTransactionRepository {
    *  do banco continua sendo a defesa final contra race. */
   hasProcessedReversal(referenceTransactionId: string, kind: WagerTransactionKind): Promise<boolean>;
 
-  save(transaction: WagerTransaction): Promise<void>;
+  /** INSERT — a transação ainda não existe no banco. Nunca faz SELECT prévio;
+   *  o único caller que chama isto sabe que está criando (nunca atualizando). */
+  create(transaction: WagerTransaction): Promise<void>;
+
+  /** UPDATE de uma transação já persistida (ex.: PENDING → PENDING_REFERENCE,
+   *  PENDING_REFERENCE → PROCESSED/REJECTED). Mapeia todo campo opcional
+   *  explicitamente para `null` quando ausente no domínio — nunca omite,
+   *  para não deixar resíduo de um estado anterior sobreviver à transição. */
+  update(transaction: WagerTransaction): Promise<void>;
 }

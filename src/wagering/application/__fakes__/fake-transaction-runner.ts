@@ -1,4 +1,4 @@
-import { TransactionRunner, WageringUnitOfWork } from '../ports/unit-of-work';
+import { WageringTransactionRunner, WageringUnitOfWork } from '../ports/unit-of-work';
 import { FakeWalletRepository } from './fake-wallet.repository';
 import { FakeWagerTransactionRepository } from './fake-wager-transaction.repository';
 import { FakeInboxRepository } from './fake-inbox.repository';
@@ -9,7 +9,7 @@ import { FakeOutboxRepository } from './fake-outbox.repository';
  *  fazem rollback juntos — nunca um commita sem o outro. É isso que permite
  *  provar atomicidade Wallet+Ledger+Inbox+Outbox mesmo sem Postgres real
  *  (ver ARCHITECTURE.md seção 3, "teste obrigatório de prova"). */
-export class FakeTransactionRunner implements TransactionRunner {
+export class FakeTransactionRunner implements WageringTransactionRunner {
   constructor(
     public readonly wallet: FakeWalletRepository,
     public readonly wagerTransaction: FakeWagerTransactionRepository,

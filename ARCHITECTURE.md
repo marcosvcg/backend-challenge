@@ -811,3 +811,51 @@ BET processado (débito + 2 eventos); saldo insuficiente (rejeição sem mover s
 ### Lacuna fechada: trigger de imutabilidade do ledger agora tem teste automatizado
 
 A validação de `UPDATE`/`DELETE` rejeitados pela trigger (seção 8) havia sido feita apenas **manualmente**, via script ad-hoc, ao validar as migrations pela primeira vez — nunca virou parte da suíte `bun test`. Isso foi identificado como lacuna real (a garantia mais crítica de auditabilidade do ledger não tinha prova automatizada) e fechado com `wallet-ledger-entry-immutability.integration.test.ts` (4 casos): `UPDATE` via SQL direto rejeitado com a mensagem específica da trigger (`wallet_ledger_entry is immutable`, não uma constraint genérica); `DELETE` idem; e, para ambos, confirmação de que a linha permanece **intacta** após a tentativa rejeitada (não apenas que a query lançou erro). `TRUNCATE` (reset de fixture) e a asserção de imutabilidade são deliberadamente mantidos como responsabilidades separadas no arquivo — o primeiro só prepara o estado antes de cada teste, nunca participa da invariante sendo provada.
+
+---
+
+## 19. `CreateWalletUseCase` — orquestração real de `OPENING`, `TransactionRunner<TUnitOfWork>` genérico
+
+**`TransactionRunner` generalizado.** Movido para `shared/application/transaction-runner.ts` como `TransactionRunner<TUnitOfWork>` — cada fluxo declara só o UoW que realmente usa. `WageringUnitOfWork` (4 repositórios, incl. inbox) continua servindo `ProcessWagerTransactionUseCase`; um novo `CreateWalletUnitOfWork` (3 repositórios — wallet, wagerTransaction, outbox, **sem** inbox) serve `CreateWalletUseCase`. O mecanismo por baixo (`em.transactional()`) é o mesmo para os dois — só muda o que `MikroOrmTransactionRunner`/`MikroOrmCreateWalletTransactionRunner` instancia dentro do `run()`.
+
+**Identidade determinística da `OPENING`:** `providerId = 'internal'`, `externalTransactionId = idempotencyKey = "opening:${walletId}"` — no máximo uma `OPENING` por wallet, sem depender de payload de provider externo. `payloadHash` via `canonicalPayloadHash()` (novo helper em `shared/idempotency/`, JSON canônico + SHA-256, cinco testes unitários) sobre os campos que definem a operação (`kind`, `walletId`, `playerId`, `currency`, `amount`) — reaproveitado também pela idempotência HTTP real quando for implementada (seção 9 do README).
+
+**Conflito de `(playerId, currency)` — nunca via `SELECT` prévio.** `WalletAlreadyExistsError` (novo, `wallet/domain/`) é lançado pelo repositório concreto ao traduzir `UniqueConstraintViolationException` do MikroORM, checando explicitamente que a constraint violada é `wallet_player_currency_unique` (qualquer outra violação de unicidade propaga como erro inesperado, não é silenciosamente tratada como conflito de negócio).
+
+### Bug 4 (mesma família dos Bugs 1-3, seção 18): cadeia de FK de 3 níveis, não 2
+
+A implementação inicial de `createWithLedger(wallet, entry)` tentava inserir `wallet` + `wallet_ledger_entry` juntos (corrigido primeiro para dois `flush()` separados), mas o teste de integração revelou uma segunda falha: `wallet_ledger_entry.transaction_id` também tem FK para `wager_transaction.id`, que ainda não existia. A cadeia real de dependência para `OPENING` é `wallet → wager_transaction → wallet_ledger_entry` — três níveis, não dois.
+
+**Correção de design, não só de ordem:** em vez de encadear três `flush()` dentro de um método `createWithLedger` cada vez mais artificial, o método foi **removido**. `CreateWalletUseCase` agora:
+1. `Wallet.open()` (saldo zero, version 1) → `uow.wallet.create(wallet)` — INSERT imediato, visível só dentro da transação.
+2. Se `initialBalance.isZero()`, retorna aqui — nenhuma `OPENING`, nenhum ledger, nenhum evento (seção 6.4: operações sem efeito no saldo não geram lançamento).
+3. Senão, constrói a `WagerTransaction` `OPENING`, aplica `wallet.credit(...)` em memória, `transaction.markProcessed(...)` — tudo ainda sem I/O.
+4. `uow.wagerTransaction.save(transaction)` — a `wager_transaction` passa a existir.
+5. `uow.wallet.saveWithLedger(wallet, ledgerEntry)` — **reaproveita o método já existente e já testado** (Incremento 6) que atualiza a wallet do saldo zero para o saldo final e insere o ledger entry, agora com a FK satisfeita.
+6. Outbox: `WagerTransactionProcessed` + `WalletBalanceChanged`.
+
+Isso eliminou a necessidade de qualquer método novo de "inserir ledger isolado" — `saveWithLedger` já fazia exatamente o que era preciso (`UPDATE` wallet + `INSERT` ledger), só faltava a wallet já existir como linha própria antes de chamá-lo. `WalletRepository` ficou com uma porta a menos (`create`, `findById`, `findByIdForUpdate`, `saveWithLedger`) do que teria com `createWithLedger` mantido.
+
+### Testes de integração (`create-wallet.integration.test.ts`, 4 casos)
+
+Saldo zero (sem `OPENING`, sem eventos); saldo positivo (`OPENING` `PROCESSED`, `providerId='internal'`, 1 ledger entry `CREDIT` balanceado, 2 eventos); **atomicidade** (falha forçada reverte wallet + `wager_transaction` + outbox juntos — nenhuma wallet órfã sobrevive); **concorrência real** (duas conexões distintas disputando o mesmo `playerId`+`currency` — exatamente 1 `created`, 1 `conflict`, nunca duas linhas na tabela `wallet`).
+
+---
+
+## 20. Ajustes pós-auditoria red-team do Incremento 7 — `WagerTransactionRepository.save()` dividido em `create()`/`update()`
+
+A auditoria aprovou as garantias críticas do Incremento 7 (atomicidade, lock pessimista, tradução de conflito) e levantou um **risco plausível, não um bug já confirmado**: `WagerTransactionRepository.save()` fazia `findOne` + `assign` (update implícito) sempre que a linha já existia, usando `wagerTransactionDomainToRow` — um mapper que constrói o payload de update condicionalmente por campo. A hipótese era que `em.assign()` não zeraria uma coluna cuja chave estivesse ausente do objeto passado, deixando resíduo de um estado anterior (ex.: `next_reference_retry_at` sobrevivendo a uma transição `PENDING_REFERENCE → PROCESSED`).
+
+**Investigação (antes de aceitar a correção como resolvendo um bug real):** escrito um teste de integração que exercita exatamente essa transição contra Postgres real. Ele passou mesmo usando o mapper antigo. Isolamento adicional (fora da suíte, via scripts ad-hoc) mostrou a causa: `wagerTransactionDomainToRow()` sempre retorna uma **instância de `new WagerTransactionRow()`**, e em TypeScript/Bun, campos de classe declarados com `?` mas nunca atribuídos já existem como **chaves próprias do objeto com valor `undefined`** — diferente de um objeto literal construído por spread condicional (`{...(x !== undefined ? {x} : {})}`), onde a chave de fato não existe. O MikroORM `assign()`, ao encontrar a chave presente com valor `undefined`, gera `SET coluna = NULL` no UPDATE — ou seja, **a coluna era zerada corretamente mesmo com o mapper antigo**. O padrão de omissão condicional por spread (que teria o bug real) existe no código, mas apenas em `wagerTransactionRowToDomain` (row → domínio), direção que nunca é passada para `assign()`.
+
+**Decisão, mesmo com o risco não confirmado como manifestado:**
+- `WagerTransactionRepository.save()` → `create()` (INSERT, sem `findOne` prévio) + `update()` (UPDATE de linha existente) **mantido** — separação semântica mais clara (INSERT nunca deveria pagar o custo de um SELECT prévio) e melhor intenção de leitura, independente do bug específico.
+- Novo `wagerTransactionDomainToUpdatePayload()` no mapper — mapeia **todo** campo opcional explicitamente para `?? null` (`referenceExternalTransactionId`, `referenceTransactionId`, `failureCode`, `processedAt`, `resultBalanceAmount`/`Currency`, `nextReferenceRetryAt`), tipado como `EntityData<WagerTransactionRow>`. **Mantido deliberadamente** mesmo com a investigação mostrando que o comportamento incidental de class-fields já produzia o resultado correto — não é seguro depender dessa semântica implícita (ela é fácil de quebrar se o mapper de update um dia for reescrito para usar objeto literal, como o de leitura já faz), então o `null` explícito torna a intenção auditável no próprio código, não uma consequência acidental de como TS declara campos de classe.
+- `wagerTransactionDomainToRow()` (usado só por `create()`) permanece com omissão condicional — correto ali, porque a linha é nova.
+- Callers atualizados: `ProcessWagerTransactionUseCase` e `CreateWalletUseCase` sempre chamam `create()`. `update()` fica pronto para o worker de `PENDING_REFERENCE`, seu primeiro caller real.
+
+**Teste de integração permanente** (`mikro-orm-wager-transaction.repository.integration.test.ts`, 2 casos): transição real `PENDING_REFERENCE → PROCESSED` via `update()`, provando contra Postgres que `next_reference_retry_at` vai de um timestamp real para `NULL` e `reference_transaction_id` vai de `NULL` para o valor correto — guarda permanente contra reintrodução do risco, não prova de que ele já havia se manifestado. Um segundo caso prova que `update()`/`create()` não apagam por engano campos que deveriam permanecer preenchidos (`failureCode`, `resultBalance` numa transação `REJECTED`).
+
+**Teste de integração para a tradução de `WalletAlreadyExistsError`** (`mikro-orm-wallet.repository.integration.test.ts`, 2 casos, Postgres real): violação de `wallet_player_currency_unique` traduzida corretamente; violação de `wallet_pkey` (mesmo `id`, `playerId` diferente) **não** traduzida — propaga como `UniqueConstraintViolationException` pura, provando que a tradução é específica à constraint, não genérica para qualquer erro de unicidade.
+
+**Deliberadamente não alterado nesta rodada** (confirmado pela auditoria, fora de escopo): número de `flush()` por operação (múltiplos round-trips na mesma transação, rollback já provado — otimizar isso fica para outro momento, se necessário); `version` continua sendo campo de domínio/auditoria, não mecanismo de concorrência — `PESSIMISTIC_WRITE` continua sendo a única proteção real, sem optimistic locking do MikroORM habilitado.

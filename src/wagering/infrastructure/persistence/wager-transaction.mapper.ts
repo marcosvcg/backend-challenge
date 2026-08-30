@@ -1,3 +1,4 @@
+import type { EntityData } from '@mikro-orm/postgresql';
 import { WagerTransaction, type WagerTransactionState } from '../../domain/wager-transaction';
 import { WagerTransactionKind } from '../../domain/wager-transaction-kind';
 import { WagerTransactionStatus } from '../../domain/wager-transaction-status';
@@ -35,6 +36,10 @@ export function wagerTransactionRowToDomain(row: WagerTransactionRow): WagerTran
   return WagerTransaction.rehydrate(state);
 }
 
+/** Usado apenas por create() — linha nova, colunas opcionais omitidas ficam
+ *  com o default/NULL do banco. NUNCA usar este shape para update(): omissão
+ *  não zera uma coluna que já tinha valor numa linha existente (ver
+ *  wagerTransactionDomainToUpdatePayload). */
 export function wagerTransactionDomainToRow(transaction: WagerTransaction): WagerTransactionRow {
   const row = new WagerTransactionRow();
   row.id = transaction.id;
@@ -75,4 +80,27 @@ export function wagerTransactionDomainToRow(transaction: WagerTransaction): Wage
   }
 
   return row;
+}
+
+/** Payload de UPDATE — todo campo opcional é mapeado EXPLICITAMENTE, usando
+ *  `null` quando o domínio está `undefined`, nunca omitido. Diferente de
+ *  wagerTransactionDomainToRow (usado só por create()): em.assign() do
+ *  MikroORM não zera uma coluna cuja chave está ausente do objeto — só omitir
+ *  o campo deixaria failure_code/next_reference_retry_at/reference_transaction_id/
+ *  processed_at/result_balance_* sobreviverem indevidamente a uma transição de
+ *  estado (ex.: PENDING_REFERENCE → PROCESSED deve limpar next_reference_retry_at). */
+export function wagerTransactionDomainToUpdatePayload(transaction: WagerTransaction): EntityData<WagerTransactionRow> {
+  const resultBalance = transaction.resultBalance?.toJSON();
+
+  return {
+    status: transaction.status,
+    referenceRetryAttempts: transaction.referenceRetryAttempts,
+    referenceExternalTransactionId: transaction.referenceExternalTransactionId ?? null,
+    referenceTransactionId: transaction.referenceTransactionId ?? null,
+    failureCode: transaction.failureCode ?? null,
+    processedAt: transaction.processedAt ?? null,
+    resultBalanceAmount: resultBalance?.amount ?? null,
+    resultBalanceCurrency: resultBalance?.currency ?? null,
+    nextReferenceRetryAt: transaction.nextReferenceRetryAt ?? null,
+  };
 }

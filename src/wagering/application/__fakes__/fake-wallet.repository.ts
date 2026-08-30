@@ -1,6 +1,7 @@
 import { Wallet } from '../../../wallet/domain/wallet';
 import { WalletLedgerEntry } from '../../../wallet/domain/wallet-ledger-entry';
 import { WalletRepository } from '../../../wallet/application/ports/wallet.repository';
+import { WalletAlreadyExistsError } from '../../../wallet/domain/wallet-already-exists.error';
 
 /** Repositório em memória para testar o use case sem Postgres. Simula "commit"
  *  via snapshot: mudanças só ficam visíveis fora da transação quando o
@@ -40,8 +41,25 @@ export class FakeWalletRepository implements WalletRepository {
     return this.committed.get(id);
   }
 
+  async create(wallet: Wallet): Promise<void> {
+    this.assertNoConflict(wallet);
+    this.staged.set(wallet.id, wallet);
+  }
+
   async saveWithLedger(wallet: Wallet, _entry: WalletLedgerEntry): Promise<void> {
     this.staged.set(wallet.id, wallet);
+  }
+
+  /** Simula a UNIQUE(player_id, currency) real do banco — fidelidade ao
+   *  comportamento real, para que testes com fakes também exerçam o caminho
+   *  de conflito sem precisar de Postgres. */
+  private assertNoConflict(wallet: Wallet): void {
+    const clash = [...this.committed.values(), ...this.staged.values()].find(
+      (existing) => existing.playerId === wallet.playerId && existing.currency === wallet.currency,
+    );
+    if (clash) {
+      throw new WalletAlreadyExistsError(wallet.playerId, wallet.currency);
+    }
   }
 
   commit(): void {

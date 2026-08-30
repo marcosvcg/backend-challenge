@@ -3,7 +3,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { createTestOrm, truncateAllTables } from '../../../shared/__test-support__/test-orm';
 import { MikroOrmTransactionRunner } from '../mikro-orm-transaction-runner';
 import { ProcessWagerTransactionUseCase } from '../../application/process-wager-transaction.use-case';
-import { TransactionRunner, WageringUnitOfWork } from '../../application/ports/unit-of-work';
+import { WageringTransactionRunner, WageringUnitOfWork } from '../../application/ports/unit-of-work';
 import { ProcessWagerTransactionCommand } from '../../application/process-wager-transaction.command';
 import { UuidIdGenerator } from '../../../shared/__test-support__/uuid-id-generator';
 import { FakeClock } from '../../application/__fakes__/fake-clock';
@@ -100,7 +100,7 @@ describe('ProcessWagerTransactionUseCase — integration (real Postgres, real Mi
     await seedWallet(orm, '100.00');
 
     const innerRunner = new MikroOrmTransactionRunner(orm.em);
-    const brokenRunner: TransactionRunner = {
+    const brokenRunner: WageringTransactionRunner = {
       run: async <T,>(work: (uow: WageringUnitOfWork) => Promise<T>) =>
         innerRunner.run(async (uow) => {
           const originalEnqueue = uow.outbox.enqueue.bind(uow.outbox);
@@ -108,7 +108,7 @@ describe('ProcessWagerTransactionUseCase — integration (real Postgres, real Mi
           uow.outbox.enqueue = async (event) => {
             calls += 1;
             if (calls === 1) {
-              throw new Error('Simulated crash right after wager_transaction.save(), before outbox fully persists.');
+              throw new Error('Simulated crash right after wagerTransaction.create(), before outbox fully persists.');
             }
             return originalEnqueue(event);
           };

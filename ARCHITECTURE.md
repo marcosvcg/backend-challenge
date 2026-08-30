@@ -859,3 +859,31 @@ A auditoria aprovou as garantias críticas do Incremento 7 (atomicidade, lock pe
 **Teste de integração para a tradução de `WalletAlreadyExistsError`** (`mikro-orm-wallet.repository.integration.test.ts`, 2 casos, Postgres real): violação de `wallet_player_currency_unique` traduzida corretamente; violação de `wallet_pkey` (mesmo `id`, `playerId` diferente) **não** traduzida — propaga como `UniqueConstraintViolationException` pura, provando que a tradução é específica à constraint, não genérica para qualquer erro de unicidade.
 
 **Deliberadamente não alterado nesta rodada** (confirmado pela auditoria, fora de escopo): número de `flush()` por operação (múltiplos round-trips na mesma transação, rollback já provado — otimizar isso fica para outro momento, se necessário); `version` continua sendo campo de domínio/auditoria, não mecanismo de concorrência — `PESSIMISTIC_WRITE` continua sendo a única proteção real, sem optimistic locking do MikroORM habilitado.
+
+---
+
+## 21. SQS Consumer — `WagerTransactionConsumer`, reutilizando o mesmo use case da entrada HTTP
+
+**Fiel ao contrato fechado na seção 13**: o consumer monta `ProcessWagerTransactionCommand { origin: 'queue', ... }` e chama `ProcessWagerTransactionUseCase.execute()` — a mesma instância/classe que a futura entrada HTTP usará. `result.ackable` decide `DeleteMessage` (ACK) ou não-ACK; a regra de negócio nunca se duplica entre as duas bordas.
+
+**Parsing estrutural separado da idempotência de negócio.** `parseWagerTransactionMessage()` valida o shape da mensagem (README seção 10) **antes** de qualquer tentativa de montar um `ProcessWagerTransactionCommand`. `MalformedWagerTransactionMessageError` (JSON inválido, campo obrigatório ausente, `kind` desconhecido ou `OPENING` — interno, nunca aceito da fila) é classificado como permanent, mas **nunca gera ACK manual nem uma `WagerTransaction REJECTED`** — a mensagem nem chegou a formar um comando válido para o domínio decidir sobre. Segue o mesmo caminho operacional de qualquer resultado não-ackable: sem ACK, redrive policy da fila move para DLQ após `maxReceiveCount` — um único mecanismo de DLQ, consistente com a decisão da seção 13.
+
+**Três classificações conceituais, dois caminhos de transporte** (mesmo padrão da seção 13): `business/handled` (ACK) vs. `transient` e `permanent` (ambos não-ACK, diferindo só em log/métrica). Confirmado agora com um caminho real de código: exceções inesperadas do use case (timeout de Postgres, bug) e erros de parsing estrutural levam ao mesmo `DeleteMessageCommand` nunca sendo chamado.
+
+**Processamento sequencial por poll**, não paralelo dentro do mesmo processo — `for...of` com `await`, no máximo uma mensagem em voo por vez. A concorrência relevante entre wallets continua vindo de múltiplas *instâncias* do consumer (processos), não de paralelismo interno; isso mantém o raciocínio sobre `SIGTERM`/graceful shutdown simples.
+
+**Graceful shutdown (`stop()`)**: seta uma flag `stopping`, nunca inicia um novo `ReceiveMessageCommand` depois dela, e deixa a mensagem em voo (se houver) terminar normalmente antes de retornar — sem `ChangeMessageVisibility(0)` para interromper processamento em andamento (não exigido pelos requisitos deste incremento).
+
+### Achado de design: `waitTimeSeconds` precisa ser configurável, não hardcoded
+
+`stop()` só retorna depois que o `ReceiveMessageCommand` **em andamento** resolve — e como esse comando usa long polling (`WaitTimeSeconds`), um valor fixo de 10s (adequado para produção/dev, reduzindo custo de polling vazio) tornaria todo teste de graceful shutdown lento e sujeito a estourar timeouts do `bun test`. Corrigido tornando `waitTimeSeconds` um parâmetro do construtor (`WagerTransactionConsumer`), com default de 10s — os testes de integração passam `1`, tornando `stop()` rápido e determinístico sem mudar o comportamento de produção. Isso não foi uma mudança cosmética: a primeira versão dos testes falhava em cascata (um teste ainda "preso" dentro de `stop()` enquanto o `beforeEach` do próximo já truncava o banco) precisamente por essa razão.
+
+### Achado de harness de teste: SQL bruto dentro de `em.transactional()` não participa da transação sem o contexto explícito
+
+Ao escrever o teste "nunca publica antes do commit" (reaproveitado do incremento do Publisher) adaptado para este consumer, uma verificação usando `em.getConnection().execute(rawSql)` dentro de um callback `transactional()` mostrou uma linha sobrevivendo a um rollback forçado. Investigação isolada (fora da suíte) confirmou: `execute()` chamado diretamente numa conexão obtida via `getConnection()` **não** participa do `BEGIN`/`COMMIT`/`ROLLBACK` gerenciado internamente por `em.transactional()`, a menos que o `transactionContext` (`em.getTransactionContext()`) seja passado explicitamente como quarto argumento. Nunca afetou código de produção — todo repositório concreto sempre escreve via `em.create()`/`em.assign()`/`flush()`, que já respeitam esse contexto internamente. Documentado aqui porque é a segunda vez que esse padrão de teste (SQL bruto dentro de uma transação MikroORM) produz um resultado enganoso — vale lembrar antes de escrever um teste de isolamento transacional no futuro.
+
+### Testes (17 unitários + 5 integração)
+
+**`parse-wager-transaction-message.test.ts`** (12 casos): mensagem válida com/sem referência opcional; JSON inválido; array em vez de objeto; campos obrigatórios ausentes; `type` inesperado; `kind` inválido; `OPENING` explicitamente rejeitado; `money` ausente ou malformado.
+
+**`wager-transaction.consumer.integration.test.ts`** (5 casos, Postgres + LocalStack reais, fila FIFO de teste dedicada com `VisibilityTimeout=2s`/`maxReceiveCount=3` — nunca a fila de produção): processa e ACKa uma mensagem válida (débito real, mensagem sai da fila); redelivery quando o use case falha transitoriamente (sem ACK, mensagem reaparece após o visibility timeout); mensagem move para a DLQ após esgotar `maxReceiveCount`; Inbox deduplica redelivery da mesma mensagem sem debitar duas vezes; `stop()` deixa a mensagem em voo terminar sem iniciar uma nova. Todas as asserções filtram por um identificador específico (`externalTransactionId`) em vez de assumir "a única mensagem da fila" — as filas de teste (principal e DLQ) acumulam mensagens de execuções anteriores da suíte, nunca são purgadas entre testes deste arquivo.

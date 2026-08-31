@@ -2,8 +2,10 @@ import { Module } from '@nestjs/common';
 import { EntityManager, MikroORM } from '@mikro-orm/postgresql';
 import { CreateWalletUseCase } from './application/create-wallet.use-case';
 import { GetWalletUseCase } from './application/get-wallet.use-case';
+import { GetWalletLedgerUseCase } from './application/get-wallet-ledger.use-case';
 import { MikroOrmCreateWalletTransactionRunner } from './infrastructure/mikro-orm-create-wallet-transaction-runner';
 import { MikroOrmWalletQueryRepository } from './infrastructure/persistence/mikro-orm-wallet-query.repository';
+import { MikroOrmWalletLedgerQueryRepository } from './infrastructure/persistence/mikro-orm-wallet-ledger-query.repository';
 import { WalletController } from './infrastructure/http/wallet.controller';
 import { ID_GENERATOR, CLOCK } from '../shared/infrastructure/shared.tokens';
 import type { IdGenerator } from '../shared/application/id-generator';
@@ -31,6 +33,11 @@ import type { Clock } from '../shared/application/clock';
     {
       provide: GetWalletUseCase,
       useFactory: (orm: MikroORM) => new GetWalletUseCase(new MikroOrmWalletQueryRepository(orm)),
+      inject: [MikroORM],
+    },
+    {
+      provide: GetWalletLedgerUseCase,
+      useFactory: (orm: MikroORM) => new GetWalletLedgerUseCase(new MikroOrmWalletLedgerQueryRepository(orm)),
       inject: [MikroORM],
     },
   ],

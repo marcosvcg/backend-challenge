@@ -1,18 +1,23 @@
-import { Body, Controller, Get, HttpCode, Inject, NotFoundException, Param, ParseUUIDPipe, Post } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Inject, NotFoundException, Param, ParseUUIDPipe, Post, Query } from '@nestjs/common';
 import { CreateWalletUseCase } from '../../application/create-wallet.use-case';
 import { GetWalletUseCase } from '../../application/get-wallet.use-case';
+import { GetWalletLedgerUseCase } from '../../application/get-wallet-ledger.use-case';
 import { Money } from '../../domain/money';
 import { WalletAlreadyExistsError } from '../../domain/wallet-already-exists.error';
+import { decodeLedgerCursor } from '../../application/wallet-ledger-cursor';
+import { parseLedgerLimit } from '../../application/wallet-ledger-limit';
 import type { IdGenerator } from '../../../shared/application/id-generator';
 import { ID_GENERATOR } from '../../../shared/infrastructure/shared.tokens';
 import { CreateWalletDto } from './create-wallet.dto';
 import { toWalletResponse, WalletResponse } from './wallet.presenter';
+import { toWalletLedgerResponse, WalletLedgerResponse } from './wallet-ledger.presenter';
 
 @Controller('wallets')
 export class WalletController {
   constructor(
     private readonly createWallet: CreateWalletUseCase,
     private readonly getWallet: GetWalletUseCase,
+    private readonly getWalletLedger: GetWalletLedgerUseCase,
     @Inject(ID_GENERATOR) private readonly ids: IdGenerator,
   ) {}
 
@@ -40,5 +45,28 @@ export class WalletController {
       throw new NotFoundException(`Wallet "${walletId}" not found.`);
     }
     return toWalletResponse(wallet);
+  }
+
+  @Get(':walletId/ledger')
+  async getLedger(
+    @Param('walletId', ParseUUIDPipe) walletId: string,
+    @Query('cursor') cursorParam: string | undefined,
+    @Query('limit') limitParam: string | undefined,
+  ): Promise<WalletLedgerResponse> {
+    // Existência da wallet é checada aqui (reaproveitando GetWalletUseCase,
+    // a MESMA consulta de GET /wallets/:walletId, nunca duplicada) — 404
+    // explícito distingue "wallet não existe" de "wallet existe, ledger
+    // vazio" (200, entries: []). GetWalletLedgerUseCase nunca decide isso —
+    // só sabe paginar o ledger de um walletId que o caller já confirmou existir.
+    const wallet = await this.getWallet.execute(walletId);
+    if (!wallet) {
+      throw new NotFoundException(`Wallet "${walletId}" not found.`);
+    }
+
+    const limit = parseLedgerLimit(limitParam);
+    const cursor = cursorParam !== undefined ? decodeLedgerCursor(cursorParam) : undefined;
+
+    const result = await this.getWalletLedger.execute(walletId, cursor, limit);
+    return toWalletLedgerResponse(result);
   }
 }

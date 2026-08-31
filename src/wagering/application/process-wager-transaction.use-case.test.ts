@@ -95,6 +95,54 @@ describe('ProcessWagerTransactionUseCase — insufficient balance', () => {
   });
 });
 
+describe('ProcessWagerTransactionUseCase — reversal would overdraw (README section 7 rule 9)', () => {
+  it('rejects a ROLLBACK of a WIN with a failureCode distinct from plain insufficient balance', async () => {
+    const { useCase, walletRepo } = setUp('100.00');
+
+    await useCase.execute(
+      betCommand({ externalTransactionId: 'ext-bet', idempotencyKey: 'p:ext-bet' }),
+    ); // 100 - 80 = 20
+
+    const win = await useCase.execute(
+      betCommand({
+        kind: WagerTransactionKind.Win,
+        externalTransactionId: 'ext-win',
+        idempotencyKey: 'p:ext-win',
+        referenceExternalTransactionId: 'ext-bet',
+        money: Money.from({ amount: '150.00', currency: 'BRL' }),
+      }),
+    ); // 20 + 150 = 170
+    expect(win.kind).toBe('processed');
+
+    await useCase.execute(
+      betCommand({ externalTransactionId: 'ext-bet-2', idempotencyKey: 'p:ext-bet-2', money: Money.from({ amount: '165.00', currency: 'BRL' }) }),
+    ); // 170 - 165 = 5 — most of the WIN's credit is already spent
+
+    const rollback = await useCase.execute(
+      betCommand({
+        kind: WagerTransactionKind.Rollback,
+        externalTransactionId: 'ext-rollback',
+        idempotencyKey: 'p:ext-rollback',
+        referenceExternalTransactionId: 'ext-win',
+        money: Money.from({ amount: '150.00', currency: 'BRL' }), // must equal the WIN's own amount
+      }),
+    );
+
+    // Reverting the WIN means debiting 150 from a wallet that only has 5 —
+    // same underlying Wallet.debit() failure as a plain BET without balance,
+    // but this is a reversal overdrawing the wallet, not a fresh bet without
+    // funds: the two situations are operationally different (README seção 7
+    // regra 9) and must carry different failureCodes even though both trace
+    // back to InsufficientBalanceError inside Wallet.
+    expect(rollback.kind).toBe('rejected');
+    expect(rollback.transaction?.failureCode).toBe('ReversalWouldOverdrawError');
+    expect(rollback.transaction?.failureCode).not.toBe('InsufficientBalanceError');
+
+    const wallet = walletRepo.getCommitted(WALLET_ID)!;
+    expect(wallet.balance.toJSON().amount).toBe('5.00'); // unchanged by the rejected rollback
+  });
+});
+
 describe('ProcessWagerTransactionUseCase — mandatory scenario (README section 8)', () => {
   it('two sequential 80.00 bets against 100.00 balance: exactly one PROCESSED, one REJECTED, final balance 20.00', async () => {
     const { useCase } = setUp('100.00');

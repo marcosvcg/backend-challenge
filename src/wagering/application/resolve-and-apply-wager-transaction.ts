@@ -33,6 +33,13 @@ const KNOWN_REJECTION_ERRORS = [
   IncompatibleReferenceError,
 ] as const;
 
+/** Seção 7 regra 9 do README: saldo insuficiente numa aposta e uma reversão
+ *  que produziria saldo negativo são operacionalmente diferentes e precisam
+ *  de failureCode distinto, mesmo nascendo do mesmo InsufficientBalanceError
+ *  em Wallet.debit() — Wallet nunca sabe o kind da operação (não deve saber),
+ *  então a tradução acontece aqui, onde transaction.kind já está disponível. */
+const REVERSAL_WOULD_OVERDRAW_FAILURE_CODE = 'ReversalWouldOverdrawError';
+
 export type PersistenceMode = 'create' | 'update';
 
 export interface ResolveAndApplyUnitOfWork {
@@ -112,7 +119,7 @@ export class ResolveAndApplyWagerTransaction {
       if (!this.isKnownRejectionError(err)) {
         throw err; // erro inesperado: propaga e provoca rollback da transação inteira
       }
-      transaction.reject(err.name, wallet.balance);
+      transaction.reject(this.failureCodeFor(err, transaction), wallet.balance);
     }
 
     // PERSISTE conforme o outcome — wager_transaction PRIMEIRO: o ledger entry
@@ -156,5 +163,16 @@ export class ResolveAndApplyWagerTransaction {
    *  maquiado como rejeição de negócio. */
   private isKnownRejectionError(err: unknown): err is Error {
     return KNOWN_REJECTION_ERRORS.some((ErrorClass) => err instanceof ErrorClass);
+  }
+
+  /** InsufficientBalanceError vem de Wallet.debit() tanto para um BET quanto
+   *  para um ROLLBACK cujo efeito invertido é um débito — Wallet não distingue
+   *  os dois casos, e não deve. A distinção de failureCode é responsabilidade
+   *  de wagering, que já sabe o kind da transação neste ponto. */
+  private failureCodeFor(err: Error, transaction: WagerTransaction): string {
+    if (err instanceof InsufficientBalanceError && transaction.kind === WagerTransactionKind.Rollback) {
+      return REVERSAL_WOULD_OVERDRAW_FAILURE_CODE;
+    }
+    return err.name;
   }
 }

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { createTestOrm, truncateAllTables } from '../../../shared/__test-support__/test-orm';
-import { UuidIdGenerator } from '../../../shared/__test-support__/uuid-id-generator';
+import { UuidIdGenerator } from '../../../shared/infrastructure/uuid-id-generator';
 import { MikroOrmCreateWalletTransactionRunner } from '../mikro-orm-create-wallet-transaction-runner';
 import { CreateWalletUseCase } from '../../application/create-wallet.use-case';
 import { CreateWalletCommand } from '../../application/create-wallet.command';

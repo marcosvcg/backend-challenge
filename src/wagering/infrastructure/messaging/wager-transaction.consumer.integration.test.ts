@@ -7,7 +7,7 @@ import { setupTestInboundQueue } from '../../../shared/__test-support__/test-inb
 import { WagerTransactionConsumer, WagerTransactionConsumerLogger } from './wager-transaction.consumer';
 import { ProcessWagerTransactionUseCase } from '../../application/process-wager-transaction.use-case';
 import { MikroOrmTransactionRunner } from '../mikro-orm-transaction-runner';
-import { UuidIdGenerator } from '../../../shared/__test-support__/uuid-id-generator';
+import { UuidIdGenerator } from '../../../shared/infrastructure/uuid-id-generator';
 import { FakeClock } from '../../application/__fakes__/fake-clock';
 import { DEFAULT_REFERENCE_RETRY_POLICY } from '../../application/reference-retry-policy';
 import { Wallet } from '../../../wallet/domain/wallet';

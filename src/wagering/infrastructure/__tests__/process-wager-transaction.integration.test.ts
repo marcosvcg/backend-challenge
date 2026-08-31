@@ -5,7 +5,7 @@ import { MikroOrmTransactionRunner } from '../mikro-orm-transaction-runner';
 import { ProcessWagerTransactionUseCase } from '../../application/process-wager-transaction.use-case';
 import { WageringTransactionRunner, WageringUnitOfWork } from '../../application/ports/unit-of-work';
 import { ProcessWagerTransactionCommand } from '../../application/process-wager-transaction.command';
-import { UuidIdGenerator } from '../../../shared/__test-support__/uuid-id-generator';
+import { UuidIdGenerator } from '../../../shared/infrastructure/uuid-id-generator';
 import { FakeClock } from '../../application/__fakes__/fake-clock';
 import { DEFAULT_REFERENCE_RETRY_POLICY } from '../../application/reference-retry-policy';
 import { Wallet } from '../../../wallet/domain/wallet';

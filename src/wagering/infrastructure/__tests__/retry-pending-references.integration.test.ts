@@ -7,7 +7,7 @@ import { ProcessWagerTransactionUseCase } from '../../application/process-wager-
 import { RetryPendingReferencesUseCase } from '../../application/retry-pending-references.use-case';
 import { ProcessWagerTransactionCommand } from '../../application/process-wager-transaction.command';
 import { ReferenceRetryPolicy } from '../../application/reference-retry-policy';
-import { UuidIdGenerator } from '../../../shared/__test-support__/uuid-id-generator';
+import { UuidIdGenerator } from '../../../shared/infrastructure/uuid-id-generator';
 import { FakeClock } from '../../application/__fakes__/fake-clock';
 import { Wallet } from '../../../wallet/domain/wallet';
 import { Money } from '../../../wallet/domain/money';

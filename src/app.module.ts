@@ -7,6 +7,7 @@ import { HealthModule } from './health/health.module';
 import { SharedModule } from './shared/shared.module';
 import { WalletModule } from './wallet/wallet.module';
 import { WageringModule } from './wagering/wagering.module';
+import { OutboxModule } from './outbox/outbox.module';
 import { DomainErrorFilter } from './shared/infrastructure/http/domain-error.filter';
 
 @Module({
@@ -24,6 +25,7 @@ import { DomainErrorFilter } from './shared/infrastructure/http/domain-error.fil
     HealthModule,
     WalletModule,
     WageringModule,
+    OutboxModule,
   ],
   providers: [
     { provide: APP_PIPE, useValue: new ValidationPipe({ whitelist: true, transform: true, forbidNonWhitelisted: true }) },

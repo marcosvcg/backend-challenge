@@ -1083,4 +1083,64 @@ Validado manualmente via HTTP real antes e depois do hardening, incluindo corrup
 
 Nenhuma mudança na estratégia Prometheus/Loki/Grafana/Alloy nem migração do consumer para o `Logger` compartilhado neste hardening.
 
+## 30. Bootstrap/lifecycle real dos 3 componentes assíncronos — `WagerConsumerRuntime`, `OutboxPublisherRuntime`, `PendingReferenceRuntime`
+
+**Estado antes deste incremento (achados do levantamento):** dos três componentes assíncronos, só `WagerTransactionConsumer` tinha lifecycle próprio (`start()`/`stop()`, já fechado desde a seção 21) — `PublishPendingOutboxMessagesUseCase` e `RetryPendingReferencesUseCase` eram `execute()` single-shot, chamados manualmente só em testes. Nenhum dos três estava conectado ao Nest DI (`OutboxModule` não existia). `main.ts` nunca chamava `app.enableShutdownHooks()` — sem isso, nenhum `OnApplicationShutdown` dispararia em `SIGTERM`/`SIGINT`, independentemente do que fosse implementado nos providers.
+
+### O problema central: `OnApplicationBootstrap` dispara em `app.init()` incondicionalmente
+
+Confirmado lendo o código-fonte do Nest (`nest-application-context.js`): `init()` chama `callBootstrapHook()` sempre, mesmo sem `app.listen()` — exatamente o que **todo** teste de integração HTTP do projeto faz (`Test.createTestingModule({imports:[AppModule]}).compile()` + `createNestApplication()` + `app.init()`, nunca `app.listen()`). Sem um gate, qualquer `OnApplicationBootstrap` que iniciasse um loop real faria **todos** os testes HTTP existentes (7 arquivos) tentar subir os três componentes de verdade.
+
+**Solução: gate positivo explícito, `START_BACKGROUND_WORKERS === 'true'`**, checado como a primeira linha de cada `onApplicationBootstrap()` — nunca inferido de `NODE_ENV=test` (que o Bun seta sozinho, mas seria frágil como único mecanismo: qualquer ambiente que não define a variável, incluindo um esquecido no futuro, nunca liga os loops por acidente; a flag exige opt-in positivo, nunca opt-out implícito). Gate ausente/qualquer valor diferente de `'true'` → `return` imediato, **nenhuma** chamada AWS, nenhuma resolução de fila, nenhuma construção de use case.
+
+### Arquitetura: 3 serviços de runtime, um por componente — não um coordenador único
+
+Avaliado e decidido explicitamente antes da implementação: um único `BackgroundJobsCoordinator` central precisaria de qualquer forma de uma abstração comum (`start()`/`stop()`) que os 3 componentes implementariam de qualquer jeito — a indireção extra não paga seu custo com só 3 componentes de lifecycle/configuração tão diferentes entre si (o consumer já long-polls nativamente; os outros dois precisam de um wrapper de intervalo fixo). `WagerConsumerRuntime`/`PendingReferenceRuntime` ficam no `WageringModule` já existente (mesmo bounded context do consumer e do worker); `OutboxPublisherRuntime` ganhou um `OutboxModule` novo (primeira composition root Nest do bounded context outbox).
+
+### `PollingLoopRunner` (`shared/infrastructure/`) — infraestrutura de lifecycle, não domínio/application
+
+Envolve os dois use cases single-shot (`PublishPendingOutboxMessagesUseCase.execute()`, `RetryPendingReferencesUseCase.execute()`) num loop com intervalo fixo. `while (!stopping) { await step(); await sleep(...) }`, deliberadamente **nunca `setInterval`** — `setInterval` dispara na cadência do timer independente de quanto a execução anterior levou; se `step()` demorar mais que `intervalMs`, execuções se sobrepõem. O loop explícito garante que o intervalo só começa a contar depois que a execução anterior termina.
+
+**Bug real encontrado e corrigido durante este incremento: `sleep()` não interrompível fazia `stop()` bloquear até `intervalMs` inteiro decorrer.** A primeira versão usava `new Promise((resolve) => setTimeout(resolve, ms))` sem nenhum mecanismo de cancelamento — `stop()` setava a flag `stopping` e aguardava a `Promise` do loop inteiro (`pollLoop`), mas se o loop estivesse **dormindo** (o estado em que ele passa a maior parte do tempo de vida — não executando `step()`), a `Promise` de `sleep()` só resolveria quando o `setTimeout` original disparasse, não quando `stop()` fosse chamado. Com um `intervalMs` de teste curto (5-20ms) isso nunca apareceu; foi descoberto ao testar `OutboxPublisherRuntime` com um `intervalMs` de produção realista (10s) — o teste travou (timeout do próprio `bun test`). Corrigido guardando o `resolve`/`clearTimeout` do `sleep()` atual (`wakeStop`), chamado por `stop()` para interromper um sleep em andamento imediatamente. Teste de regressão dedicado: `stop()` chamado durante um sleep de 10s retorna em menos de 500ms.
+
+### Resolução de URL de fila — `SqsQueueUrlResolver`, injetado, nunca chamado em provider factory
+
+`GetQueueUrlCommand` resolve `SQS_INBOUND_QUEUE_NAME`/`SQS_OUTBOUND_QUEUE_NAME` (config canônica já existente) para a URL completa — nunca derivada manualmente do padrão de path do LocalStack (acoplaria produção ao emulador). `SqsQueueUrlResolver` é registrado no `SharedModule` (`@Global()`, um único `SQSClient` reaproveitado) mas a chamada real a `GetQueueUrlCommand` só acontece **dentro** de `onApplicationBootstrap()` de cada runtime, depois do gate já ter sido checado — nunca em tempo de módulo/boot do Nest. `SqsQueueUrlResolver` é **injetado** no construtor de `WagerConsumerRuntime`/`OutboxPublisherRuntime` (não importado/construído como função direta) — é essa injeção que torna os dois testáveis com um resolver fake, sem depender de LocalStack real. Falha em `GetQueueUrlCommand` com o gate ligado propaga e derruba o bootstrap (fail-fast) — nunca sobe fingindo que um componente está operacional.
+
+### `OutboxPublisherRuntime` monta seu use case dentro do bootstrap, não recebe pronto via DI
+
+Diferente de `PendingReferenceRuntime` (recebe `RetryPendingReferencesUseCase` já pronto via DI — não depende de SQS, só de Postgres) e de `WagerConsumerRuntime` (recebe `ProcessWagerTransactionUseCase` pronto, reaproveitado do `WageringModule`, nunca uma segunda instância), `PublishPendingOutboxMessagesUseCase` depende de `SqsPublisherAdapter`, que por sua vez depende da URL da fila de saída — disponível só depois da resolução assíncrona e condicional ao gate. Registrá-lo como provider fixo do `OutboxModule` (com uma `useFactory` síncrona, tempo de boot) violaria a exigência de nunca fazer chamada AWS fora do controle do gate. `OutboxPublisherRuntime` recebe só as peças que não dependem de rede (`EntityManager`, `SqsQueueUrlResolver`, `Clock`, `Logger`) via construtor, e monta `PublishPendingOutboxMessagesUseCase` internamente, uma vez, dentro de `onApplicationBootstrap()`.
+
+### Shutdown gracioso
+
+`main.ts` ganhou `app.enableShutdownHooks()` — sem essa linha, nada do resto dispara em `SIGTERM`/`SIGINT`. Os três runtimes implementam `OnApplicationShutdown.onApplicationShutdown(signal?)`, chamando seu `stop()` interno (`WagerTransactionConsumer.stop()` diretamente; `PollingLoopRunner.stop()` para os outros dois) — nenhum usa `ChangeMessageVisibility(0)`/cancelamento agressivo, mesma filosofia já documentada para o consumer desde a seção 21 ("não há necessidade de interromper processamento em andamento"). `WagerConsumerRuntime.consumer`/os `runner`s dos outros dois só existem se o gate estava ligado (`?.` opcional) — `onApplicationShutdown()` chamado sem um `start()` prévio (gate desligado) é um no-op seguro.
+
+### Multi-instância — nenhuma coordenação em memória nova, o desenho existente já garante isso
+
+Consumer: múltiplas instâncias competem naturalmente pela mesma fila SQS (`ReceiveMessage` distribui entre consumidores concorrentes) — SQS já é o coordenador. Outbox Publisher / PendingReference Worker: `FOR UPDATE SKIP LOCKED` (seções 18/23) continua sendo a única garantia — nenhum lock/lease em memória foi introduzido ao conectar ao lifecycle.
+
+### Configuração via environment variables (novas, documentadas no `.env` como comentário — nunca ligadas por padrão)
+
+```
+START_BACKGROUND_WORKERS=true          # gate — ausente/≠'true' mantém os 3 componentes desligados
+SQS_CONSUMER_WAIT_TIME_SECONDS=10      # já era parâmetro do construtor do consumer, agora exposto via env
+OUTBOX_PUBLISHER_INTERVAL_MS=5000
+OUTBOX_PUBLISHER_BATCH_SIZE=10
+PENDING_REFERENCE_WORKER_INTERVAL_MS=5000
+```
+
+### Testes — cada runtime isolado, com dependências fake/stub, nunca um teste HTTP com o gate ligado
+
+Decisão explícita: nenhum teste de integração HTTP existente foi alterado para "provar" lifecycle — os 7 arquivos de teste HTTP continuam exatamente como estavam, e a suíte completa (274 pass) confirma que nenhum deles inicia os loops reais por acidente (a prova é a ausência de qualquer flakiness/timeout novo, não um teste dedicado a isso).
+
+- `polling-loop-runner.test.ts` (7 casos): chamadas repetidas com intervalo; `stop()` impede nova iteração; shutdown aguarda a iteração em voo; **regressão do sleep não-interrompível**; `stop()` idempotente (sem `start()` prévio, ou chamado duas vezes); erro inesperado numa iteração reportado via `onError` sem derrubar o loop nem criar sobreposição; nunca duas iterações concorrentes mesmo com `step()` mais lento que `intervalMs`.
+- `sqs-queue-url-resolver.test.ts` (3 casos, `SQSClient` fake): resolve corretamente; lança se a resposta não tiver `QueueUrl`; propaga (nunca engole) uma falha do client.
+- `wager-consumer.runtime.test.ts` (5 casos, `ProcessWagerTransactionUseCase` stub + resolver fake): gate ausente/`'false'` → zero chamadas ao resolver; gate ligado → resolve exatamente uma vez; nome de fila ausente com gate ligado → falha rápido, nunca chama o resolver; `onApplicationShutdown()` sem bootstrap prévio é no-op seguro.
+- `outbox-publisher.runtime.test.ts` (5 casos, `EntityManager`/`Clock` stub + resolver fake): mesmos cinco cenários espelhados para o publisher.
+- `pending-reference.runtime.test.ts` (4 casos, `RetryPendingReferencesUseCase` spy): gate desligado (ausente e `'false'`) → zero chamadas a `execute()`; gate ligado → `execute()` chamado pelo menos uma vez; shutdown aguarda a iteração em voo e para novo polling.
+
+**Verificação manual real**, Nest + Postgres + LocalStack + `START_BACKGROUND_WORKERS=true` (filas de produção provisionadas via `bun run setup:localstack`): os três runtimes iniciaram com sucesso, cada um logando sua URL/config resolvida; um `BET` submetido via HTTP gerou eventos que o `OutboxPublisherRuntime` publicou automaticamente na fila `wager-events.fifo` dentro do ciclo configurado (5 mensagens confirmadas via leitura direta da fila), sem nenhuma chamada manual ao publisher. **Verificação de `SIGTERM`/`SIGINT` real não automatizável neste ambiente**: Windows não tem sinais POSIX nativos — `taskkill` sem `/F` foi rejeitado pelo SO para este tipo de processo, e a plataforma de deploy real (containers Linux) é onde esse mecanismo de fato importa. A cobertura de `onApplicationShutdown()`/`stop()` em si (aguardar iteração em voo, prevenir novo polling, idempotência) está inteiramente provada pelos testes unitários acima; o que fica sem prova automatizada é só "o SO/Nest efetivamente invoca o hook" — comportamento do próprio framework, não lógica deste incremento.
+
+Suíte completa: 274 pass / 0 fail (250 + 24 novos: 7 `PollingLoopRunner` + 3 `SqsQueueUrlResolver` + 5 `WagerConsumerRuntime` + 5 `OutboxPublisherRuntime` + 4 `PendingReferenceRuntime`). `bun run build`: limpo.
+
 Suíte completa: 250 pass / 0 fail (247 + 3 novos: `invalid_entry` e o teste extra de prioridade `invalid_entry` vs. `broken_chain`). `bun run build`: limpo.

@@ -2,6 +2,7 @@ import { Body, Controller, Get, HttpCode, Inject, NotFoundException, Param, Pars
 import { CreateWalletUseCase } from '../../application/create-wallet.use-case';
 import { GetWalletUseCase } from '../../application/get-wallet.use-case';
 import { GetWalletLedgerUseCase } from '../../application/get-wallet-ledger.use-case';
+import { ReconcileWalletUseCase } from '../../application/reconcile-wallet.use-case';
 import { Money } from '../../domain/money';
 import { WalletAlreadyExistsError } from '../../domain/wallet-already-exists.error';
 import { decodeLedgerCursor } from '../../application/wallet-ledger-cursor';
@@ -11,6 +12,7 @@ import { ID_GENERATOR } from '../../../shared/infrastructure/shared.tokens';
 import { CreateWalletDto } from './create-wallet.dto';
 import { toWalletResponse, WalletResponse } from './wallet.presenter';
 import { toWalletLedgerResponse, WalletLedgerResponse } from './wallet-ledger.presenter';
+import { toWalletReconciliationResponse, WalletReconciliationResponse } from './wallet-reconciliation.presenter';
 
 @Controller('wallets')
 export class WalletController {
@@ -18,6 +20,7 @@ export class WalletController {
     private readonly createWallet: CreateWalletUseCase,
     private readonly getWallet: GetWalletUseCase,
     private readonly getWalletLedger: GetWalletLedgerUseCase,
+    private readonly reconcileWallet: ReconcileWalletUseCase,
     @Inject(ID_GENERATOR) private readonly ids: IdGenerator,
   ) {}
 
@@ -68,5 +71,21 @@ export class WalletController {
 
     const result = await this.getWalletLedger.execute(walletId, cursor, limit);
     return toWalletLedgerResponse(result);
+  }
+
+  @Post(':walletId/reconciliation')
+  @HttpCode(200)
+  async reconcile(@Param('walletId', ParseUUIDPipe) walletId: string): Promise<WalletReconciliationResponse> {
+    // Caso de uso completo: ReconcileWalletUseCase busca a própria wallet
+    // (via WalletQueryRepository — a MESMA porta que GetWalletUseCase usa,
+    // nunca duplicada; os dois nunca dependem um do outro) e devolve um
+    // resultado discriminado. O controller só converte wallet-not-found em
+    // 404 — nenhuma outra decisão de existência mora aqui.
+    const result = await this.reconcileWallet.execute(walletId);
+    if (result.kind === 'wallet-not-found') {
+      throw new NotFoundException(`Wallet "${walletId}" not found.`);
+    }
+
+    return toWalletReconciliationResponse(walletId, result.reconciliation);
   }
 }

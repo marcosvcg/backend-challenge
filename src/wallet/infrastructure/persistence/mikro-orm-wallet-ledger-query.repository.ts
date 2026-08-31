@@ -42,4 +42,19 @@ export class MikroOrmWalletLedgerQueryRepository implements WalletLedgerQueryRep
     const rows = await qb.execute('all');
     return rows.map((row: WalletLedgerEntryRow) => walletLedgerEntryRowToDomain(row));
   }
+
+  /** Sem paginação — usado por ReconcileWalletUseCase, que precisa do ledger
+   *  inteiro para o cálculo ser correto (ARCHITECTURE.md seção 29). Mesma
+   *  ordenação de fetchPage, mesmo índice reaproveitado. */
+  async fetchAll(walletId: string): Promise<WalletLedgerEntry[]> {
+    const em = this.orm.em.fork();
+    const rows = await em
+      .createQueryBuilder(WalletLedgerEntryRow)
+      .select('*')
+      .where({ walletId })
+      .orderBy({ createdAt: 'ASC', id: 'ASC' })
+      .execute('all');
+
+    return rows.map((row: WalletLedgerEntryRow) => walletLedgerEntryRowToDomain(row));
+  }
 }

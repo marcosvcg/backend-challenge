@@ -12,9 +12,10 @@ import { WagerConsumerRuntime } from './infrastructure/messaging/wager-consumer.
 import { PendingReferenceRuntime } from './infrastructure/pending-reference.runtime';
 import { WagerTransactionController } from './infrastructure/http/wager-transaction.controller';
 import { WagerTransactionQueryController } from './infrastructure/http/wager-transaction-query.controller';
-import { ID_GENERATOR, CLOCK } from '../shared/infrastructure/shared.tokens';
+import { ID_GENERATOR, CLOCK, METRICS } from '../shared/infrastructure/shared.tokens';
 import type { IdGenerator } from '../shared/application/id-generator';
 import type { Clock } from '../shared/application/clock';
+import type { MetricsPort } from '../shared/application/metrics';
 
 /** Mesmo padrão de wallet.module.ts: EntityManager raiz do Nest injetado
  *  aqui é seguro porque MikroOrmTransactionRunner/
@@ -46,20 +47,25 @@ import type { Clock } from '../shared/application/clock';
   providers: [
     {
       provide: ProcessWagerTransactionUseCase,
-      useFactory: (em: EntityManager, ids: IdGenerator, clock: Clock) =>
-        new ProcessWagerTransactionUseCase(new MikroOrmTransactionRunner(em), ids, clock, DEFAULT_REFERENCE_RETRY_POLICY),
-      inject: [EntityManager, ID_GENERATOR, CLOCK],
-    },
-    {
-      provide: RetryPendingReferencesUseCase,
-      useFactory: (em: EntityManager, ids: IdGenerator, clock: Clock) =>
-        new RetryPendingReferencesUseCase(
-          new MikroOrmPendingReferenceWorkerTransactionRunner(em),
+      useFactory: (em: EntityManager, ids: IdGenerator, clock: Clock, metrics: MetricsPort) =>
+        new ProcessWagerTransactionUseCase(
+          new MikroOrmTransactionRunner(em, metrics),
           ids,
           clock,
           DEFAULT_REFERENCE_RETRY_POLICY,
         ),
-      inject: [EntityManager, ID_GENERATOR, CLOCK],
+      inject: [EntityManager, ID_GENERATOR, CLOCK, METRICS],
+    },
+    {
+      provide: RetryPendingReferencesUseCase,
+      useFactory: (em: EntityManager, ids: IdGenerator, clock: Clock, metrics: MetricsPort) =>
+        new RetryPendingReferencesUseCase(
+          new MikroOrmPendingReferenceWorkerTransactionRunner(em, metrics),
+          ids,
+          clock,
+          DEFAULT_REFERENCE_RETRY_POLICY,
+        ),
+      inject: [EntityManager, ID_GENERATOR, CLOCK, METRICS],
     },
     {
       provide: GetWagerTransactionByIdUseCase,

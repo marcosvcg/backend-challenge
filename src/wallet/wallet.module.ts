@@ -30,9 +30,9 @@ import type { Logger } from '../shared/application/logger';
   providers: [
     {
       provide: CreateWalletUseCase,
-      useFactory: (em: EntityManager, ids: IdGenerator, clock: Clock) =>
-        new CreateWalletUseCase(new MikroOrmCreateWalletTransactionRunner(em), ids, clock),
-      inject: [EntityManager, ID_GENERATOR, CLOCK],
+      useFactory: (em: EntityManager, ids: IdGenerator, clock: Clock, metrics: MetricsPort) =>
+        new CreateWalletUseCase(new MikroOrmCreateWalletTransactionRunner(em, metrics), ids, clock),
+      inject: [EntityManager, ID_GENERATOR, CLOCK, METRICS],
     },
     {
       provide: GetWalletUseCase,

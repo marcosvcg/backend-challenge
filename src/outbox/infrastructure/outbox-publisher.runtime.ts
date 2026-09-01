@@ -6,9 +6,15 @@ import { SqsPublisherAdapter } from './sqs-publisher.adapter';
 import { PollingLoopRunner } from '../../shared/infrastructure/polling-loop-runner';
 import { SqsQueueUrlResolver } from '../../shared/infrastructure/messaging/sqs-queue-url-resolver';
 import { createSqsClient } from '../../shared/infrastructure/messaging/sqs-client-factory';
+import {
+  OUTBOX_MESSAGES_PUBLISHED_TOTAL,
+  OUTBOX_PUBLISH_RETRIES_TOTAL,
+  OUTBOX_LAG_SECONDS,
+} from '../application/outbox-metrics';
 import type { Clock } from '../../shared/application/clock';
 import type { Logger } from '../../shared/application/logger';
-import { CLOCK, LOGGER } from '../../shared/infrastructure/shared.tokens';
+import type { MetricsPort } from '../../shared/application/metrics';
+import { CLOCK, LOGGER, METRICS } from '../../shared/infrastructure/shared.tokens';
 
 const DEFAULT_INTERVAL_MS = 5000;
 const DEFAULT_BATCH_SIZE = 10;
@@ -28,7 +34,12 @@ const DEFAULT_BATCH_SIZE = 10;
  *  depende da URL da fila de saída, só disponível depois da resolução
  *  assíncrona e condicional ao gate — resolver isso numa provider factory
  *  síncrona de módulo (tempo de boot) violaria a exigência de nunca fazer
- *  chamada AWS fora do controle do gate. */
+ *  chamada AWS fora do controle do gate.
+ *
+ *  Instrumentação (outbox_messages_published_total/outbox_publish_retries_total/
+ *  outbox_lag_seconds) acontece SEMPRE depois que useCase.execute() já
+ *  resolveu — a transação de publicação já comitou nesse ponto — nunca
+ *  dentro do use case (ARCHITECTURE.md seção 31). */
 @Injectable()
 export class OutboxPublisherRuntime implements OnApplicationBootstrap, OnApplicationShutdown {
   private runner?: PollingLoopRunner;
@@ -38,6 +49,7 @@ export class OutboxPublisherRuntime implements OnApplicationBootstrap, OnApplica
     private readonly queueUrlResolver: SqsQueueUrlResolver,
     @Inject(CLOCK) private readonly clock: Clock,
     @Inject(LOGGER) private readonly logger: Logger,
+    @Inject(METRICS) private readonly metrics: MetricsPort,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -69,7 +81,22 @@ export class OutboxPublisherRuntime implements OnApplicationBootstrap, OnApplica
     );
 
     this.runner = new PollingLoopRunner(
-      () => useCase.execute(),
+      async () => {
+        const result = await useCase.execute();
+        // Instrumentado AQUI, depois de execute() já ter resolvido — um
+        // incremento por mensagem publicada/reagendada nesta iteração
+        // (nunca um único incremento "em lote").
+        for (let i = 0; i < result.published; i += 1) {
+          this.metrics.incrementCounter(OUTBOX_MESSAGES_PUBLISHED_TOTAL);
+        }
+        for (let i = 0; i < result.failed; i += 1) {
+          this.metrics.incrementCounter(OUTBOX_PUBLISH_RETRIES_TOTAL);
+        }
+        for (const lagSeconds of result.publishedLagsSeconds) {
+          this.metrics.observeHistogram(OUTBOX_LAG_SECONDS, lagSeconds);
+        }
+        return result;
+      },
       intervalMs,
       (err) => this.logger.error('OutboxPublisherRuntime iteration failed', { error: String(err) }),
     );

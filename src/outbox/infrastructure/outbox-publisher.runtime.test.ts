@@ -4,6 +4,7 @@ import { OutboxPublisherRuntime } from './outbox-publisher.runtime';
 import { SqsQueueUrlResolver } from '../../shared/infrastructure/messaging/sqs-queue-url-resolver';
 import { Clock } from '../../shared/application/clock';
 import { Logger } from '../../shared/application/logger';
+import { MetricsPort } from '../../shared/application/metrics';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -15,6 +16,10 @@ function silentLogger(): Logger {
 
 function fixedClock(): Clock {
   return { now: () => new Date('2026-01-01T00:00:00.000Z') };
+}
+
+function noopMetrics(): MetricsPort {
+  return { incrementCounter: () => {}, setGauge: () => {}, observeHistogram: () => {} };
 }
 
 /** EntityManager nunca é exercitado nestes testes: o gate desligado nunca
@@ -47,7 +52,7 @@ describe('OutboxPublisherRuntime', () => {
   it('gate off (START_BACKGROUND_WORKERS unset): onApplicationBootstrap() never resolves the queue URL', async () => {
     delete process.env.START_BACKGROUND_WORKERS;
     const { resolver, getResolveCalls } = fakeResolver();
-    const runtime = new OutboxPublisherRuntime(stubEntityManager(), resolver, fixedClock(), silentLogger());
+    const runtime = new OutboxPublisherRuntime(stubEntityManager(), resolver, fixedClock(), silentLogger(), noopMetrics());
 
     await runtime.onApplicationBootstrap();
 
@@ -58,7 +63,7 @@ describe('OutboxPublisherRuntime', () => {
   it('gate off (START_BACKGROUND_WORKERS=false): still never resolves the queue URL', async () => {
     process.env.START_BACKGROUND_WORKERS = 'false';
     const { resolver, getResolveCalls } = fakeResolver();
-    const runtime = new OutboxPublisherRuntime(stubEntityManager(), resolver, fixedClock(), silentLogger());
+    const runtime = new OutboxPublisherRuntime(stubEntityManager(), resolver, fixedClock(), silentLogger(), noopMetrics());
 
     await runtime.onApplicationBootstrap();
 
@@ -70,7 +75,7 @@ describe('OutboxPublisherRuntime', () => {
     process.env.SQS_OUTBOUND_QUEUE_NAME = 'wager-events.fifo';
     process.env.OUTBOX_PUBLISHER_INTERVAL_MS = '10000'; // long enough that shutdown happens well before a 2nd iteration
     const { resolver, getResolveCalls } = fakeResolver();
-    const runtime = new OutboxPublisherRuntime(stubEntityManager(), resolver, fixedClock(), silentLogger());
+    const runtime = new OutboxPublisherRuntime(stubEntityManager(), resolver, fixedClock(), silentLogger(), noopMetrics());
 
     await runtime.onApplicationBootstrap();
     await sleep(10); // let the first iteration attempt happen (it will fail against the stub EM — irrelevant here)
@@ -83,14 +88,20 @@ describe('OutboxPublisherRuntime', () => {
     process.env.START_BACKGROUND_WORKERS = 'true';
     delete process.env.SQS_OUTBOUND_QUEUE_NAME;
     const { resolver, getResolveCalls } = fakeResolver();
-    const runtime = new OutboxPublisherRuntime(stubEntityManager(), resolver, fixedClock(), silentLogger());
+    const runtime = new OutboxPublisherRuntime(stubEntityManager(), resolver, fixedClock(), silentLogger(), noopMetrics());
 
     await expect(runtime.onApplicationBootstrap()).rejects.toThrow('SQS_OUTBOUND_QUEUE_NAME is required');
     expect(getResolveCalls()).toBe(0);
   });
 
   it('onApplicationShutdown() without a prior bootstrap (or with the gate off) is a safe no-op', async () => {
-    const runtime = new OutboxPublisherRuntime(stubEntityManager(), fakeResolver().resolver, fixedClock(), silentLogger());
+    const runtime = new OutboxPublisherRuntime(
+      stubEntityManager(),
+      fakeResolver().resolver,
+      fixedClock(),
+      silentLogger(),
+      noopMetrics(),
+    );
     await expect(runtime.onApplicationShutdown()).resolves.toBeUndefined();
   });
 });

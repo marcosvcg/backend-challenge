@@ -7,16 +7,36 @@ import { WalletRow } from './wallet.row';
 import { WalletLedgerEntryRow } from './wallet-ledger-entry.row';
 import { walletDomainToRow, walletRowToDomain } from './wallet.mapper';
 import { walletLedgerEntryDomainToRow } from './wallet-ledger-entry.mapper';
+import { MetricsPort } from '../../../shared/application/metrics';
+import { WALLET_LOCK_ACQUISITION_DURATION_SECONDS } from '../../application/wallet-lock-metric';
 
 const PLAYER_CURRENCY_UNIQUE_CONSTRAINT = 'wallet_player_currency_unique';
 
+const noopMetrics: MetricsPort = {
+  incrementCounter: () => {},
+  setGauge: () => {},
+  observeHistogram: () => {},
+};
+
 /** Construído sempre com o EntityManager "forked" da transação corrente —
- *  nunca o EntityManager global do módulo Nest (ver ARCHITECTURE.md seção 3/4). */
+ *  nunca o EntityManager global do módulo Nest (ver ARCHITECTURE.md seção 3/4).
+ *
+ *  metrics é opcional (default no-op) — alteração mínima e aditiva para
+ *  instrumentar wallet_lock_acquisition_duration_seconds em
+ *  findByIdForUpdate() (ARCHITECTURE.md seção 31): duração da chamada
+ *  PESSIMISTIC_WRITE em si, um fato de infraestrutura verdadeiro
+ *  independente do desfecho da transação — nunca uma contagem de resultado
+ *  de negócio, então seguro de medir aqui, mesmo antes do commit. */
 export class MikroOrmWalletRepository implements WalletRepository {
-  constructor(private readonly em: EntityManager) {}
+  constructor(
+    private readonly em: EntityManager,
+    private readonly metrics: MetricsPort = noopMetrics,
+  ) {}
 
   async findByIdForUpdate(id: string): Promise<Wallet> {
+    const startedAt = Date.now();
     const row = await this.em.findOneOrFail(WalletRow, { id }, { lockMode: LockMode.PESSIMISTIC_WRITE });
+    this.metrics.observeHistogram(WALLET_LOCK_ACQUISITION_DURATION_SECONDS, (Date.now() - startedAt) / 1000);
     return walletRowToDomain(row);
   }
 

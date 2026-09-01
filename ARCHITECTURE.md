@@ -1143,4 +1143,166 @@ Decisão explícita: nenhum teste de integração HTTP existente foi alterado pa
 
 Suíte completa: 274 pass / 0 fail (250 + 24 novos: 7 `PollingLoopRunner` + 3 `SqsQueueUrlResolver` + 5 `WagerConsumerRuntime` + 5 `OutboxPublisherRuntime` + 4 `PendingReferenceRuntime`). `bun run build`: limpo.
 
-Suíte completa: 250 pass / 0 fail (247 + 3 novos: `invalid_entry` e o teste extra de prioridade `invalid_entry` vs. `broken_chain`). `bun run build`: limpo.
+## 31. Grupo H — observabilidade obrigatória do README: `MetricsPort`/`MetricsExporter`, `/metrics`, logs estruturados, DLQ Gauge, labels Loki
+
+**Estado antes deste incremento:** a seção 29 já tinha criado a fundação (`MetricsPort`, `Logger`, `PrometheusMetrics`, `ConsoleLogger`) e a seção 30 já tinha conectado o lifecycle real dos 3 workers + o serviço `app`/stack completa no Compose. Faltava: as métricas específicas exigidas pelo README (transações por status, duplicatas, retries, DLQ, conflito de lock, lag do outbox, latência de processamento), o endpoint `/metrics`, e a decisão de como os logs de cada container chegam ao Loki de forma consultável.
+
+### Decisões estruturais aprovadas antes da implementação
+
+- **Lag do outbox — opção (a2):** `PublishPendingOutboxMessagesUseCase` devolve aditivamente `publishedLagsSeconds: number[]` (um valor por mensagem publicada nesta chamada) — nunca uma query periódica separada, que arriscaria observar a mesma mensagem mais de uma vez. `OutboxPublisherRuntime` só observa cada lag depois que `execute()` já resolveu (a transação de publicação já comitou).
+- **Redelivery SQS — opção (b1):** alteração mínima e aditiva em `WagerTransactionConsumer` — solicita `ApproximateReceiveCount` via `MessageSystemAttributeNames` no `ReceiveMessageCommand`; `receiveCount > 1` incrementa `sqs_message_redeliveries_total` uma vez por entrega. Nenhuma mudança em ACK/retry/DLQ/visibility/parsing.
+- **Lock da wallet — opção (c1):** só a duração de `findByIdForUpdate()` é instrumentada, como `wallet_lock_acquisition_duration_seconds` (Histogram) — deliberadamente **não** um contador de "conflito" baseado em threshold arbitrário: `findByIdForUpdate()` usa `PESSIMISTIC_WRITE`, que **espera** se outra transação já detém o lock, em vez de falhar; contenção real aparece como cauda longa na distribuição de duração, não como evento discreto.
+- **`MetricsPort` (recording) separado de `MetricsExporter` (scrape) — correção arquitetural do usuário.** Proposta inicial (adicionar `exportText()` direto ao `MetricsPort`) foi rejeitada: recording e scrape são responsabilidades distintas, cada caller de `MetricsPort` (use cases/runtimes) não deveria enxergar um método de exportação Prometheus-específico. `PrometheusMetrics` implementa as duas interfaces sobre o **mesmo** `Registry` singleton — `METRICS_EXPORTER` é registrado via `{ provide: METRICS_EXPORTER, useExisting: METRICS }` (alias real para a mesma instância já resolvida por `METRICS`, nunca um segundo `Registry`/uma segunda construção de `PrometheusMetrics`).
+- **Nenhuma observabilidade na readiness da API** — `/health/ready` continua checando só Postgres/SQS (README seção 9), nunca Prometheus/Loki/Grafana/Alloy.
+
+### Regras invioláveis (mantidas em todo o incremento)
+
+`walletId`, `transactionId`, `messageId`, `playerId`, `externalTransactionId` e `correlationId` nunca viram labels Prometheus nem labels Loki — ficam exclusivamente dentro do corpo JSON estruturado dos logs, nunca promovidos a label de nenhum dos dois sistemas (ambos pagam custo de cardinalidade por série/stream). Nenhum módulo de domínio/application importa `prom-client`, Loki, Grafana ou Alloy — todo acesso passa por `MetricsPort`/`Logger` (portas puras). Um único `Registry` Prometheus (nunca um segundo). Logs nunca substituem uma métrica obrigatória do README. Nenhuma métrica é incrementada num ponto onde uma falha antes do commit produziria uma contagem financeira falsa — todas as métricas de resultado de transação são instrumentadas nos **callers** (`WagerTransactionController`, `WagerTransactionConsumer`), estritamente **depois** que `await useCase.execute(...)` já resolveu (ou seja, depois que a transação SQL já comitou), nunca dentro do use case/`ResolveAndApplyWagerTransaction`.
+
+### Tabela de métricas implementadas
+
+| Nome | Tipo | Labels | Ponto de incremento/observação | Semântica |
+|---|---|---|---|---|
+| `wager_transactions_total` | Counter | `status` (`processed`\|`rejected`\|`pending_reference`), `origin` (`http`\|`queue`) | `WagerTransactionController`/`WagerTransactionConsumer`, depois de `execute()` resolver | Contagem por resultado real; `replay` **nunca** re-incrementa |
+| `wager_transaction_duplicates_total` | Counter | `origin` | idem, quando `result.kind === 'replay'` | Idempotência detectada — nunca conta como novo processamento |
+| `wager_transaction_processing_duration_seconds` | Histogram | `origin` | idem, duração medida ao redor de `execute()` | Latência de processamento fim-a-fim do use case |
+| `outbox_messages_published_total` | Counter | — | `OutboxPublisherRuntime`, um incremento por mensagem publicada nesta iteração, depois de `execute()` resolver | Mensagens efetivamente publicadas no SQS |
+| `outbox_publish_retries_total` | Counter | — | idem, um incremento por mensagem que falhou e foi reagendada nesta iteração | Falhas de publicação/reagendamento |
+| `outbox_lag_seconds` | Histogram | — | idem, um `observe()` por `publishedLagsSeconds[]` devolvido pelo use case | Atraso entre `occurredAt` do evento e o instante em que foi publicado |
+| `wallet_lock_acquisition_duration_seconds` | Histogram | — | `MikroOrmWalletRepository.findByIdForUpdate()`, ao redor do `findOneOrFail` com `PESSIMISTIC_WRITE` | Duração de aquisição do lock pessimista — contenção aparece como cauda longa |
+| `sqs_message_redeliveries_total` | Counter | — | `WagerTransactionConsumer.processOne()`, quando `ApproximateReceiveCount > 1` | Uma entrega redelivery da mesma mensagem (não uma vez por mensagem única) |
+| `sqs_dlq_messages` | Gauge | `queue` (`wager-transactions`\|`wager-events`) | `DlqGaugeRuntime`, `GetQueueAttributesCommand(ApproximateNumberOfMessages)` periódico (30s) contra as duas filas DLQ | Snapshot do tamanho da DLQ — nunca inferido do fluxo do consumer, é o SQS quem decide redrive |
+
+### `DlqGaugeRuntime` — quarto "runtime", padrão idêntico aos três já existentes
+
+Mesmo gate positivo explícito (`START_BACKGROUND_WORKERS === 'true'`, checado primeira linha), mesmo `PollingLoopRunner`, mesma injeção de `SqsQueueUrlResolver` (nunca chamado em provider factory). Diferença estrutural: resolve **duas** URLs de fila (as duas DLQs) em vez de uma, e seu `step` é uma leitura read-only externa (`GetQueueAttributesCommand`), não a chamada de um use case de aplicação. Registrado como provider simples do `SharedModule` (`@Global()`, junto de `MetricsPort`/`Logger`/etc., já que não pertence a nenhum bounded context específico — é infraestrutura de mensageria transversal).
+
+### `/metrics` — `MetricsController`
+
+Endpoint único de scrape, registrado no `SharedModule` (`controllers: [MetricsController]`) — mesmo módulo que já possui `METRICS_EXPORTER`. Sem autenticação, mesmo espírito de `/health/live`/`/health/ready` (infraestrutura, não endpoint de negócio). Usa `@Res()` explícito em vez de retorno direto — o `Content-Type` do Prometheus (`text/plain; version=0.0.4; charset=utf-8`) vem dinamicamente do `Registry`, não pode ser um `@Header()` estático. `Cache-Control: no-store` sempre — Prometheus precisa sempre do estado fresco, nunca uma resposta em cache.
+
+### Logs estruturados — `instrumentProcessResult()`, um único ponto de instrumentação compartilhado
+
+Função pura em `wagering/application/instrument-process-result.ts`, chamada pelos dois callers (`WagerTransactionController`, `WagerTransactionConsumer`) depois de `execute()` resolver — evita duplicar a lógica "que métrica incrementar para qual `result.kind`" e "que campos logar" em dois lugares. Cada log inclui sempre `correlationId` e condicionalmente `messageId`/`providerId`/`transactionId`/`walletId` (quando aplicável ao `result.kind`) — os cinco identificadores de alta cardinalidade do README, todos dentro do corpo JSON, nunca como label de métrica.
+
+### Alloy → Loki — labels por container (correção pós-verificação manual)
+
+**Configuração inicial (`discovery.docker` → `loki.source.docker` sem relabeling) tinha um bug real, encontrado só na verificação manual com a stack completa rodando:** todos os containers (app, localstack, postgres, prometheus, loki, alloy, grafana) eram enviados ao Loki sob um único stream `service_name="unknown_service"`, sem nenhum label que permitisse isolar logs da aplicação do ruído de infraestrutura (ex.: `localstack.request.aws`, queries internas do próprio Loki). Os logs JSON estruturados do app chegavam corretamente — o problema era puramente de classificação/filtragem, não de perda de dados.
+
+**Decisão do usuário: manter logs de todos os containers (não filtrar só para `app`), mas promover metadata Docker/Compose para labels Loki de baixa cardinalidade.** `observability/alloy-config.river` ganhou um `discovery.relabel` entre `discovery.docker` e `loki.source.docker`:
+
+```river
+discovery.relabel "container_labels" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+```
+
+`compose_service` (fonte: label Docker `com.docker.compose.service`, o mesmo nome do serviço no `docker-compose.yml`) e `container` (nome do container) — exatamente 7 valores fixos e conhecidos (`app`, `postgres`, `localstack`, `prometheus`, `loki`, `alloy`, `grafana`), cardinalidade zero-risco. `{compose_service="app"}` isola logs da aplicação; `{compose_service="localstack"}`/`{compose_service="postgres"}`/etc. continuam disponíveis para diagnóstico de infraestrutura quando necessário. `correlationId`/`transactionId`/`walletId`/`messageId`/`providerId` permanecem exclusivamente dentro do JSON estruturado — nunca promovidos a label Loki, mesma disciplina de cardinalidade já aplicada ao lado Prometheus.
+
+### Testes
+
+Filosofia idêntica à seção 30: cada runtime/controller isolado com dependências fake/controláveis; nenhum teste HTTP existente foi alterado para provar instrumentação.
+
+- `prometheus-metrics.test.ts` (8 casos, 3 originais + 5 novos): semântica de sobrescrita de `setGauge`; rastreamento de gauge por combinação de labels; sufixos `_count`/`_sum` de `observeHistogram`; segurança de reuso de nome para Gauge/Histogram (cache-by-name, evita o erro de registro duplicado do `prom-client`); `export()` devolve o mesmo estado acumulado que `MetricsPort` registrou.
+- `dlq-gauge.runtime.test.ts` (4 casos, resolver fake): gate ausente/`'false'` → zero chamadas ao resolver; gate ligado → resolve as duas URLs de DLQ (inbound e outbound) exatamente uma vez cada; `onApplicationShutdown()` sem bootstrap prévio é no-op seguro.
+- `metrics.controller.test.ts` (2 casos, `MetricsExporter`/`Response` fake): corpo e `Content-Type` vêm do resultado do exporter; `Cache-Control: no-store` sempre presente.
+- `wager-transaction-metrics.integration.test.ts` (5 casos, **arquivo novo**, `AppModule` real + Postgres real + `METRICS` sobrescrito via `.overrideProvider(METRICS).useValue(fakeMetrics)`): bet `PROCESSED` incrementa `wager_transactions_total{status:processed,origin:http}` exatamente uma vez e observa a duration histogram; bet `REJECTED` incrementa com `status:rejected`; replay de uma transação `PROCESSED` **nunca** re-incrementa `wager_transactions_total`, mas incrementa `wager_transaction_duplicates_total`; bet `PROCESSED` observa `wallet_lock_acquisition_duration_seconds`; uma falha de validação 400 (nunca chega ao use case) nunca toca `wager_transactions_total`.
+- Testes já existentes de `wager-consumer.runtime`, `outbox-publisher.runtime`, `publish-pending-outbox-messages` (integração) atualizados para os novos parâmetros/campos (`metrics`/`clock` opcionais com default `noop`/`system`; `publishedLagsSeconds` no resultado) — nenhuma mudança de comportamento, só assinatura.
+
+**Verificação manual real, stack completa (`docker compose up --build`, incluindo `app`/`prometheus`/`loki`/`alloy`/`grafana`), com tráfego HTTP real:**
+
+1. `GET app:3000/metrics` — todas as famílias de métrica presentes e populadas com valores reais após uma wallet criada + um `BET` processado via HTTP (`wager_transactions_total{status="processed",origin="http"} 1`, histogramas de duração/lock, `outbox_messages_published_total`/`outbox_lag_seconds` já refletindo os eventos publicados pelo `OutboxPublisherRuntime` em background).
+2. Prometheus (`/api/v1/targets`) — `health: "up"`, `lastError: ""` para o target `app:3000`; `/api/v1/query?query=wager_transactions_total` devolve a série real ingerida.
+3. Loki, antes da correção de relabeling — confirmado o bug (stream único `unknown_service`, logs de todos os containers misturados, sem label utilizável).
+4. Loki, depois da correção — `{compose_service="app"} |= "wager_transaction_processed"` devolve exatamente o log JSON estruturado da transação recém-processada, com `correlationId`/`providerId`/`transactionId`/`walletId` intactos; `{compose_service="localstack"}` devolve só logs do LocalStack (`AWS sqs.ReceiveMessage => 200`, etc.) e **zero** resultados para `wager_transaction_processed`; `label/compose_service/values` devolve exatamente os 7 serviços do Compose.
+5. Grafana — os dois datasources (`Prometheus`, `Loki`) provisionados e `readOnly: true`; proxy de datasource testado diretamente (`/api/datasources/proxy/uid/.../loki/api/v1/label/compose_service/values`) confirma que Grafana consegue de fato consultar o Loki através do datasource, não só que ele está cadastrado.
+
+Suíte completa: 290 pass / 0 fail (274 + 16 novos: 5 `prometheus-metrics` + 4 `dlq-gauge.runtime` + 2 `metrics.controller` + 5 `wager-transaction-metrics.integration`). `bun run build`: limpo.
+
+### Pendências conhecidas, fora do escopo deste incremento
+
+Hardening SQS (DLQ policy tuning, redrive automatizado) e verificação multi-instância — próximos incrementos, aguardando revisão do usuário.
+
+## 32. Dashboard Grafana — `wagering-observability.json`, provisionado por arquivo, sem import manual
+
+**Estado antes deste incremento:** a seção 31 tinha deixado o dashboard Grafana explicitamente fora de escopo. Este incremento entrega o dashboard, com dois requisitos adicionais do usuário: (1) toda query PromQL/LogQL confirmada contra o código real antes de escrever qualquer JSON — nunca assumida a partir da tabela de métricas da seção 31; (2) `docker compose up --build` deve produzir a stack com o dashboard já carregado, sem `Import JSON` manual pela UI do Grafana, em qualquer máquina.
+
+### Auditoria de labels antes de escrever qualquer query — dois desvios reais encontrados
+
+Lendo o código-fonte de cada métrica (não a tabela da seção 31, que documenta semântica mas não garante labels exatos), dois pontos que a especificação original do dashboard assumia como disponíveis **não existem**:
+
+- `sqs_message_redeliveries_total` é incrementada em `wager-transaction.consumer.ts` via `this.metrics.incrementCounter(SQS_MESSAGE_REDELIVERIES_TOTAL)` — **sem nenhum label**, nem `queue`. Coerente com o desenho atual: só existe consumer para `wager-transactions.fifo` hoje, nenhum consumer para `wager-events.fifo`. O painel de redeliveries é uma série global, documentado como tal na `description` do painel — nunca inventado um `by (queue)` que os dados não sustentam.
+- `wallet_lock_acquisition_duration_seconds` é observada em `mikro-orm-wallet.repository.ts` via `observeHistogram(WALLET_LOCK_ACQUISITION_DURATION_SECONDS, ...)` — também **sem nenhum label**, nem `origin`. O painel de locking mostra p50/p95/p99 globais, sem segmentação — única métrica de latência do dashboard sem `by (origin)`, porque é a única que de fato não tem esse label.
+
+`wager_transaction_processing_duration_seconds` (com `origin`) é a exceção real — só essa métrica de duração sustenta `by (le, origin)`.
+
+### `histogram_quantile` agregado com `sum by (le[, origin])` — correção para multi-instância
+
+Toda query `histogram_quantile` do dashboard soma os buckets antes de calcular o quantil: `histogram_quantile(0.95, sum by (le) (rate(m_bucket[5m])))`, nunca `histogram_quantile(0.95, rate(m_bucket[5m]))` direto. Sem o `sum by (le)`, com múltiplas instâncias do `app` cada uma expondo sua própria série de buckets (Prometheus rotula cada série por `instance`), `histogram_quantile` calcularia um quantil por instância isoladamente — errado assim que o sistema rodar com ≥2 réplicas (verificação multi-instância é o próximo incremento, seção 31 pendências). Aplicado consistentemente a `wallet_lock_acquisition_duration_seconds` (`sum by (le)`), `outbox_lag_seconds` (`sum by (le)`) e `wager_transaction_processing_duration_seconds` (`sum by (le, origin)`, preservando a segmentação por origem).
+
+### Variables de investigação — textbox com `.*`, nunca `label_values()`
+
+Confirmado antes de decidir: Loki 3.2.1 / Grafana 11.3.1 (versões pinadas no `docker-compose.yml`) suportam `label_values()` para variables — mas só funcionaria para labels Loki reais (`compose_service`, `container`). `providerId`/`correlationId`/`walletId`/`transactionId` nunca são labels Loki (mesma disciplina de cardinalidade da seção 31, aplicada também ao lado de logs) — ficam exclusivamente dentro do corpo JSON. `label_values()` não é aplicável a eles sem promovê-los a label, o que violaria a regra de cardinalidade. Solução: 4 variables `type: textbox`, default `.*` (nunca string vazia) — um filtro vazio combinado com `=~""` filtraria só entradas com o campo literalmente vazio, escondendo tudo; `.*` como default é "sem filtro", e qualquer valor digitado vira um filtro real via `| campo=~"$variavel"`.
+
+As variables só são aplicadas ao painel "Investigação de transações" (Row 8) — nunca ao painel "Logs gerais do app", que permanece `{compose_service="app"} | json` sem nenhum filtro adicional. Decisão deliberada: se algum evento não tiver um dos quatro campos (ex.: `idempotency-conflict` não carrega `transactionId`/`walletId`, confirmado em `instrument-process-result.ts`), um filtro `=~""` implícito em qualquer variable vazia esconderia esse log até do painel geral — mantendo o painel geral sem filtro, ele nunca perde uma linha por causa de uma variable.
+
+### UIDs de datasource — `prometheus`/`loki`, fixados no provisioning
+
+`observability/grafana-provisioning/datasources/datasources.yml` não tinha `uid` explícito antes deste incremento — o Grafana gerava um UID aleatório por instância (confirmado na verificação manual da seção 31: UIDs como `P8E80F9AEF21F6940` apareceram no `docker compose up` daquela sessão). Um dashboard JSON que referencia um UID de datasource teria que ser reeditado a cada `docker compose up --build` em uma máquina nova, ou os painéis quebrariam silenciosamente (datasource "not found"). Corrigido adicionando `uid: prometheus`/`uid: loki` ao `datasources.yml` — todo `target.datasource.uid` do dashboard referencia esses dois valores fixos, nunca um UID copiado de um ambiente específico.
+
+### Provisioning por arquivo — `dashboards/dashboards.yml` + `observability/dashboards/`
+
+Estrutura nova: `observability/grafana-provisioning/dashboards/dashboards.yml` (provider `type: file`, `path: /var/lib/grafana/dashboards`) + `observability/dashboards/wagering-observability.json` (o dashboard). `docker-compose.yml` ganhou um segundo volume no serviço `grafana`: `./observability/dashboards:/var/lib/grafana/dashboards:ro`. Nenhuma mudança no volume de `grafana-provisioning` já existente (`datasources.yml` continua no mesmo lugar) — só um provider novo (`dashboards.yml`), paralelo ao de datasources, ambos sob `/etc/grafana/provisioning/`.
+
+### Estrutura do dashboard — 8 rows, conforme aprovado
+
+VISÃO GERAL (7 Stats: throughput, processed/rejected/pending_reference rate, duplicatas, `up{job="app"}` com disclaimer explícito de que não substitui `/health/live`/`/health/ready`, DLQ atual, divergências de reconciliation 1h) · TRANSAÇÕES (por status, por origem, duplicatas, Rejection Rate — nunca Error Rate, `status="rejected"` não distingue tecnicamente `InsufficientBalanceError` de outra causa) · LATÊNCIA (p50/p95/p99 + média, `by origin`) · CONCORRÊNCIA/LOCKING (p50/p95/p99 globais, painel documentado como proxy de contenção via duração de aquisição, nunca um contador de conflito) · SQS/RETRIES/DLQ (redeliveries global, DLQ `by (queue)`) · OUTBOX (throughput publicado, retry rate, lag p50/p95/p99 com nota sobre o teto de resolução dos buckets default) · CONSISTÊNCIA FINANCEIRA (divergências ao longo do tempo, breakdown `by (reason)`) · LOGS E INVESTIGAÇÃO (3 painéis Loki: geral sem filtro, investigação de transações com as 4 variables, divergências de reconciliation via `event="wallet_reconciliation_divergence"`).
+
+Thresholds só onde o usuário aprovou uma regra semanticamente defensável: DLQ e reconciliation (`0` = saudável, `>0` = atenção, `colorMode: background`). Nenhum threshold em p95/p99/latência/lock/outbox lag — sem SLO definido, qualquer corte ali seria arbitrário. `refresh: 10s`, `time: now-15m`, `schemaVersion: 42`, layout 24 colunas.
+
+### Testes — nenhum arquivo TypeScript alterado
+
+Este incremento é inteiramente configuração/JSON (`datasources.yml`, `dashboards.yml`, `docker-compose.yml`, `wagering-observability.json`) — nenhuma mudança em código de produção ou teste. `bun run build`/`bun test` rodados ao final só para confirmar ausência de regressão, não porque o incremento tocou lógica.
+
+**Verificação manual real**, `docker compose up --build` (stack completa recriada do zero — `docker compose down` preservando o volume nomeado `postgres_data`, confirmado via `docker volume ls` antes de recriar):
+
+1. Logs do Grafana: `inserting datasource from configuration name=Prometheus uid=prometheus` / `name=Loki uid=loki`; `provisioning.dashboard`: "starting to provision dashboards" → "finished to provision dashboards", sem erro.
+2. `GET /api/search?type=dash-db` — dashboard encontrável com `uid: wagering-observability`, título correto.
+3. `GET /api/dashboards/uid/wagering-observability` — `meta.provisionedExternalId: "wagering-observability.json"` (confirma origem por arquivo, não import manual); único conjunto de `datasource.uid` referenciado nos 36 painéis: `{"prometheus", "loki"}` — nenhum UID solto/gerado.
+4. Tráfego real gerado (wallet + 5 `BET` processados + 1 `BET` rejeitado por saldo insuficiente + 1 reconciliation consistente) e confirmado via Prometheus API: throughput (`rate()` reage corretamente — zero quando não há tráfego na janela, não-zero segundos depois de uma transação nova), `sum by (status)`, Rejection Rate, p50/p95 de `wager_transaction_processing_duration_seconds{origin="http"}`, p95 de `wallet_lock_acquisition_duration_seconds` (sem label), p95 de `outbox_lag_seconds` (~7.25s — dentro da faixa dos buckets default, evidenciando na prática a limitação documentada), `sqs_dlq_messages by (queue)` (as duas filas seguras, ambas em 0).
+5. Loki: painel geral (`{compose_service="app"} | json`) retornando os logs estruturados parseados corretamente; painel de investigação com as 4 variables em `.*` retornando todas as 7 linhas de `wager_transaction_processed` da sessão (prova de que o default não esconde nada); a mesma query com um `correlationId` específico (não `.*`) retornando exatamente 1 linha (prova de que o filtro funciona quando preenchido).
+6. `templating.list` do dashboard carregado via API confirmado: 4 variables, todas `type: "textbox"`, `query: ".*"`, `current: {value: ".*"}`.
+
+Suíte completa: 290 pass / 0 fail (sem mudança — nenhum código tocado). `bun run build`: limpo.
+
+### Limitações conhecidas, levadas adiante sem alteração de instrumentação
+
+`sqs_message_redeliveries_total` sem `by (queue)` e `wallet_lock_acquisition_duration_seconds` sem `by (origin)` — ambas limitações reais da instrumentação atual, não do dashboard; documentadas nas `description` dos respectivos painéis, nunca contornadas inventando um label que os dados não têm. Buckets default do `prom-client` (até 10s) em `outbox_lag_seconds` — p99 perde resolução acima desse teto; documentado no painel, não corrigido (mudaria instrumentação sem aprovação, conforme instrução explícita do usuário). Nenhuma correção de instrumentação foi feita para "deixar um painel bonito".
+
+### Hardening pós-aprovação: descriptions genéricas de multi-instância + `clamp_min` no Rejection Rate
+
+Dois ajustes pontuais, aprovados após a revisão inicial do dashboard, nenhum deles tocando instrumentação/backend/composição da stack:
+
+- **Descriptions**: as 3 ocorrências de "para permanecer correto com ≥2 réplicas" (nos três painéis de p50/p95/p99 de `wager_transaction_processing_duration_seconds`) trocadas por uma formulação genérica de multi-instância ("agrega os buckets de todas as instâncias antes do cálculo do quantil, permanecendo correto em execução multi-instância") — texto explicativo apenas, nenhuma mudança nas queries `sum by (le, origin)`/`sum by (le)`, que já estavam corretas desde a aprovação original.
+- **Rejection Rate — `0/0 = NaN` confirmado empiricamente e corrigido com `clamp_min`**: consultado diretamente o Prometheus numa janela real sem tráfego (`100 * sum(rate(wager_transactions_total{status="rejected"}[5m])) / sum(rate(wager_transactions_total[5m]))`) — resultado `"NaN"`, confirmando a suspeita antes de qualquer alteração. Testadas duas correções: (a) `numerador or vector(0)` / `denominador or vector(1)` — **não funciona**, porque `or` só substitui séries *ausentes*, e aqui ambas as séries existem e valem exatamente `0` (não estão ausentes), então a divisão `0/0` continua acontecendo (`NaN` confirmado empiricamente nessa variante também); (b) `clamp_min(denominador, 1e-9)` — funciona: `clamp_min(x, lower) = max(x, lower)`, então para qualquer taxa real (mesmo baixíssima, ordens de magnitude acima de `1e-9`) o clamp é matematicamente neutro, e só altera o resultado exatamente quando o denominador é zero. Query final: `100 * sum(rate(wager_transactions_total{status="rejected"}[5m])) / clamp_min(sum(rate(wager_transactions_total[5m])), 1e-9)`. Validado nos dois regimes contra o Prometheus real: janela sem tráfego → `"0"` (antes `"NaN"`); janela com 1 processed + 1 rejected reais → `"50"` (percentual correto, prova de que o clamp não distorce o caso não-degenerado).
+
+**Verificação manual real**: JSON validado (`bun -e "JSON.parse(...)"`); Grafana confirmado servindo a versão atualizada do arquivo via API (`GET /api/dashboards/uid/wagering-observability` já retorna a `expr`/`description` corrigidas — o provider de dashboards recarrega o arquivo automaticamente, `updateIntervalSeconds: 30`, sem precisar reiniciar o container). Durante essa verificação, uma wallet usada em checagens anteriores desta mesma sessão deixou de existir no Postgres (`WalletRow not found`) — não um bug da correção: a suíte `bun test` completa (que faz `truncateAllTables` no `beforeEach` de cada teste de integração) rodou nesse meio-tempo contra o mesmo Postgres real exposto na porta `5432`, usado tanto pelos testes automatizados quanto pela verificação manual via `docker compose`. Contornado recriando a wallet e regerando o tráfego; não é um problema de produção (nenhum ambiente real roda a suíte de integração apontando para o mesmo Postgres que está sendo demonstrado).
+
+Suíte completa: 290 pass / 0 fail (sem mudança — nenhum código tocado). `bun run build`: limpo.
+
+### Pendências conhecidas, fora do escopo deste incremento
+
+- Hardening SQS (DLQ policy tuning, redrive automatizado) — próximo incremento, aguardando revisão do usuário.
+- Verificação multi-instância (≥3 réplicas do `app`) — próximo incremento; ao implementar, confirmar explicitamente que o Prometheus faz scrape de **cada réplica individualmente** (não apenas que os `histogram_quantile` deste dashboard já agregam corretamente via `sum by (le[, origin])` — isso já está pronto, mas depende de o `prometheus.yml` de fato descobrir/scraping todas as instâncias, o que ainda não foi verificado com múltiplas réplicas reais rodando).
+- Auditoria final do README (fora deste incremento): revisitar se `wallet_lock_acquisition_duration_seconds` como proxy de contenção satisfaz suficientemente o requisito literal de "métrica de lock conflicts" do README, ou se uma métrica adicional/complementar seria esperada por uma leitura mais literal do texto — decisão explicitamente adiada para essa auditoria, não resolvida agora.

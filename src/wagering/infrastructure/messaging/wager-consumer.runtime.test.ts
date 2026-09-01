@@ -3,9 +3,19 @@ import { WagerConsumerRuntime } from './wager-consumer.runtime';
 import { ProcessWagerTransactionUseCase } from '../../application/process-wager-transaction.use-case';
 import { SqsQueueUrlResolver } from '../../../shared/infrastructure/messaging/sqs-queue-url-resolver';
 import { Logger } from '../../../shared/application/logger';
+import { MetricsPort } from '../../../shared/application/metrics';
+import { Clock } from '../../../shared/application/clock';
 
 function silentLogger(): Logger {
   return { info: () => {}, warn: () => {}, error: () => {} };
+}
+
+function noopMetrics(): MetricsPort {
+  return { incrementCounter: () => {}, setGauge: () => {}, observeHistogram: () => {} };
+}
+
+function fixedClock(): Clock {
+  return { now: () => new Date('2026-01-01T00:00:00.000Z') };
 }
 
 /** ProcessWagerTransactionUseCase é uma classe concreta — este stub nunca é
@@ -40,7 +50,7 @@ describe('WagerConsumerRuntime', () => {
   it('gate off (START_BACKGROUND_WORKERS unset): onApplicationBootstrap() never resolves the queue URL', async () => {
     delete process.env.START_BACKGROUND_WORKERS;
     const { resolver, getResolveCalls } = fakeResolver();
-    const runtime = new WagerConsumerRuntime(stubUseCase(), resolver, silentLogger());
+    const runtime = new WagerConsumerRuntime(stubUseCase(), resolver, silentLogger(), noopMetrics(), fixedClock());
 
     await runtime.onApplicationBootstrap();
 
@@ -51,7 +61,7 @@ describe('WagerConsumerRuntime', () => {
   it('gate off (START_BACKGROUND_WORKERS=false): still never resolves the queue URL', async () => {
     process.env.START_BACKGROUND_WORKERS = 'false';
     const { resolver, getResolveCalls } = fakeResolver();
-    const runtime = new WagerConsumerRuntime(stubUseCase(), resolver, silentLogger());
+    const runtime = new WagerConsumerRuntime(stubUseCase(), resolver, silentLogger(), noopMetrics(), fixedClock());
 
     await runtime.onApplicationBootstrap();
 
@@ -62,7 +72,7 @@ describe('WagerConsumerRuntime', () => {
     process.env.START_BACKGROUND_WORKERS = 'true';
     process.env.SQS_INBOUND_QUEUE_NAME = 'wager-transactions.fifo';
     const { resolver, getResolveCalls } = fakeResolver();
-    const runtime = new WagerConsumerRuntime(stubUseCase(), resolver, silentLogger());
+    const runtime = new WagerConsumerRuntime(stubUseCase(), resolver, silentLogger(), noopMetrics(), fixedClock());
 
     await runtime.onApplicationBootstrap();
     await runtime.onApplicationShutdown();
@@ -74,14 +84,20 @@ describe('WagerConsumerRuntime', () => {
     process.env.START_BACKGROUND_WORKERS = 'true';
     delete process.env.SQS_INBOUND_QUEUE_NAME;
     const { resolver, getResolveCalls } = fakeResolver();
-    const runtime = new WagerConsumerRuntime(stubUseCase(), resolver, silentLogger());
+    const runtime = new WagerConsumerRuntime(stubUseCase(), resolver, silentLogger(), noopMetrics(), fixedClock());
 
     await expect(runtime.onApplicationBootstrap()).rejects.toThrow('SQS_INBOUND_QUEUE_NAME is required');
     expect(getResolveCalls()).toBe(0);
   });
 
   it('onApplicationShutdown() without a prior bootstrap (or with the gate off) is a safe no-op', async () => {
-    const runtime = new WagerConsumerRuntime(stubUseCase(), fakeResolver().resolver, silentLogger());
+    const runtime = new WagerConsumerRuntime(
+      stubUseCase(),
+      fakeResolver().resolver,
+      silentLogger(),
+      noopMetrics(),
+      fixedClock(),
+    );
     await expect(runtime.onApplicationShutdown()).resolves.toBeUndefined();
   });
 });

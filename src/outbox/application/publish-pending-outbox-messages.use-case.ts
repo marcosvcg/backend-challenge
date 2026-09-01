@@ -12,6 +12,15 @@ export interface PublishPendingOutboxMessagesResult {
   claimed: number;
   published: number;
   failed: number;
+  /** Um valor por mensagem PUBLICADA nesta execução — publishedAt (o
+   *  instante em que markPublished() rodou, dentro desta mesma transação já
+   *  comitada quando o caller observa isto) menos envelope.occurredAt (o
+   *  instante em que o evento foi enfileirado). Nunca observado como métrica
+   *  aqui dentro — o caller (OutboxPublisherRuntime) decide isso, sempre
+   *  depois que execute() já resolveu, para nunca produzir uma observação
+   *  associada a um lag que a transação depois reverteu
+   *  (ARCHITECTURE.md seção 31). */
+  publishedLagsSeconds: number[];
 }
 
 export class PublishPendingOutboxMessagesUseCase {
@@ -32,6 +41,7 @@ export class PublishPendingOutboxMessagesUseCase {
 
       let published = 0;
       let failed = 0;
+      const publishedLagsSeconds: number[] = [];
 
       // A transação PERMANECE ABERTA durante todo este loop, incluindo os
       // awaits de I/O de rede ao SQS — trade-off assumido conscientemente
@@ -65,12 +75,15 @@ export class PublishPendingOutboxMessagesUseCase {
         }
 
         if (sent) {
-          await uow.outboxPublisher.markPublished(message.id, this.clock.now());
+          const publishedAt = this.clock.now();
+          await uow.outboxPublisher.markPublished(message.id, publishedAt);
           published += 1;
+          const occurredAt = new Date(message.envelope.occurredAt);
+          publishedLagsSeconds.push((publishedAt.getTime() - occurredAt.getTime()) / 1000);
         }
       }
 
-      return { claimed: batch.length, published, failed };
+      return { claimed: batch.length, published, failed, publishedLagsSeconds };
     });
   }
 }

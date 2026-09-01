@@ -1,7 +1,11 @@
 import { DeleteMessageCommand, Message, ReceiveMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { ProcessWagerTransactionUseCase } from '../../application/process-wager-transaction.use-case';
+import { instrumentProcessResult } from '../../application/instrument-process-result';
 import { parseWagerTransactionMessage, MalformedWagerTransactionMessageError } from './parse-wager-transaction-message';
 import { wagerTransactionMessageToCommand } from './wager-transaction-message.mapper';
+import { MetricsPort } from '../../../shared/application/metrics';
+import { Clock } from '../../../shared/application/clock';
+import { SQS_MESSAGE_REDELIVERIES_TOTAL } from '../../../shared/application/sqs-metrics';
 
 export interface WagerTransactionConsumerLogger {
   info(message: string, meta?: Record<string, unknown>): void;
@@ -23,7 +27,18 @@ const consoleLogger: WagerTransactionConsumerLogger = {
  *  Processamento sequencial por poll (não paralelo dentro do mesmo processo):
  *  a concorrência relevante entre wallets vem de múltiplas INSTÂNCIAS deste
  *  consumer, não de paralelismo interno — mantém o raciocínio sobre graceful
- *  shutdown simples (no máximo uma mensagem em voo por vez). */
+ *  shutdown simples (no máximo uma mensagem em voo por vez).
+ *
+ *  metrics/clock são opcionais (default no-op/relógio real) — alteração
+ *  mínima e aditiva para instrumentação (ARCHITECTURE.md seção 31), nenhuma
+ *  mudança de ACK/retry/DLQ/visibility/parsing. */
+const noopMetrics: MetricsPort = {
+  incrementCounter: () => {},
+  setGauge: () => {},
+  observeHistogram: () => {},
+};
+const systemClock: Clock = { now: () => new Date() };
+
 export class WagerTransactionConsumer {
   private stopping = false;
   private pollLoop?: Promise<void>;
@@ -39,6 +54,8 @@ export class WagerTransactionConsumer {
      *  levar. Testes de integração usam um valor baixo (ex.: 1s) para tornar
      *  stop() rápido e determinístico. */
     private readonly waitTimeSeconds: number = 10,
+    private readonly metrics: MetricsPort = noopMetrics,
+    private readonly clock: Clock = systemClock,
   ) {}
 
   start(): void {
@@ -72,6 +89,10 @@ export class WagerTransactionConsumer {
           QueueUrl: this.queueUrl,
           MaxNumberOfMessages: 10,
           WaitTimeSeconds: this.waitTimeSeconds, // long polling
+          // Solicitado só para instrumentar sqs_message_redeliveries_total
+          // (ARCHITECTURE.md seção 31) — não afeta ACK/retry/DLQ/visibility,
+          // que continuam decididos exatamente como antes.
+          MessageSystemAttributeNames: ['ApproximateReceiveCount'],
         }),
       );
       return result.Messages ?? [];
@@ -88,10 +109,30 @@ export class WagerTransactionConsumer {
       return;
     }
 
+    // receiveCount > 1 → esta entrega não é a primeira tentativa (o SQS já
+    // redeliverou pelo menos uma vez) — um incremento por ENTREGA, não por
+    // mensagem única (ARCHITECTURE.md seção 31). Puramente informativo:
+    // nunca influencia ACK/retry/DLQ, que continuam decididos abaixo
+    // exatamente como antes.
+    const receiveCount = Number(message.Attributes?.ApproximateReceiveCount ?? '1');
+    if (receiveCount > 1) {
+      this.metrics.incrementCounter(SQS_MESSAGE_REDELIVERIES_TOTAL);
+    }
+
     try {
       const parsed = parseWagerTransactionMessage(message.Body);
       const command = wagerTransactionMessageToCommand(parsed);
+      const startedAt = this.clock.now().getTime();
       const result = await this.useCase.execute(command);
+      // Instrumentado AQUI, depois de execute() já ter resolvido — a
+      // transação SQL já comitou; nunca dentro do use case
+      // (ARCHITECTURE.md seção 31).
+      const durationSeconds = (this.clock.now().getTime() - startedAt) / 1000;
+      instrumentProcessResult(result, 'queue', durationSeconds, this.metrics, this.logger, {
+        correlationId: command.correlationId,
+        messageId: parsed.messageId,
+        providerId: command.providerId,
+      });
 
       if (result.ackable) {
         await this.ack(receiptHandle);

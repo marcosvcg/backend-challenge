@@ -29,5 +29,108 @@ services:
       timeout: 5s
       retries: 10
 
+  # Job one-shot: aplica as migrations do MikroORM e termina. Idempotente —
+  # a tabela de controle de migrations (ensureTable()/umzug por baixo) só
+  # aplica o que ainda não foi registrado; confirmado empiricamente rodando
+  # duas vezes seguidas dentro deste mesmo tipo de container antes de fechar
+  # esta composição (ARCHITECTURE.md).
+  #
+  # `bun node_modules/.bin/mikro-orm-esm migration:up`, NUNCA
+  # `bun run mikro-orm migration:up`: o script nomeado do package.json
+  # (invocado via `bun run <nome>`) faz o Bun reinterpretar mal os argumentos
+  # do shebang multi-parte do binário (`#!/usr/bin/env -S node --loader
+  # ts-node/esm --no-warnings=...`), tratando `--no-warnings=...` como uma
+  # flag do próprio `bun run` — confirmado empiricamente (o comando via
+  # script nomeado falha com "The argument '--no-warnings' does not take a
+  # value", o binário invocado diretamente por arquivo funciona). Nenhuma
+  # mudança em package.json — o script "mikro-orm" continua existindo para
+  # uso local fora do compose.
+  migrate:
+    build: .
+    command: ["bun", "node_modules/.bin/mikro-orm-esm", "migration:up"]
+    environment:
+      DATABASE_HOST: postgres
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Job one-shot: cria/configura as filas SQS (setup-localstack.ts) e
+  # termina. Idempotente — CreateQueueCommand com os mesmos atributos não
+  # falha se a fila já existir, SetQueueAttributes sempre reaplica a redrive
+  # policy (comentário original do próprio script); confirmado empiricamente
+  # rodando duas vezes seguidas dentro deste mesmo tipo de container.
+  localstack-setup:
+    build: .
+    command: ["bun", "scripts/setup-localstack.ts"]
+    environment:
+      SQS_ENDPOINT: http://localstack:4566
+    env_file: .env
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  # API HTTP + os 3 workers assíncronos (WagerTransactionConsumer,
+  # OutboxPublisherRuntime, PendingReferenceRuntime) — o sistema operacional
+  # completo, não só a camada HTTP. Só sobe depois que schema E filas
+  # existem de fato (service_completed_successfully), nunca torcendo para um
+  # setup manual ter rodado antes (ARCHITECTURE.md).
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_HOST: postgres
+      SQS_ENDPOINT: http://localstack:4566
+      START_BACKGROUND_WORKERS: "true"
+    env_file: .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      localstack-setup:
+        condition: service_completed_successfully
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - app
+
+  loki:
+    image: grafana/loki:3.2.1
+    ports:
+      - "3100:3100"
+
+  # Descobre containers via o socket do Docker (discovery.docker) e lê o
+  # stdout de cada um diretamente — nunca depende de capturar stdout de um
+  # processo rodando fora do Docker no host. Funciona porque `app` agora é
+  # um serviço real deste compose, não um processo solto no Windows.
+  alloy:
+    image: grafana/alloy:v1.5.1
+    volumes:
+      - ./observability/alloy-config.river:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
+    depends_on:
+      - loki
+      - app
+
+  # Dashboard provisionado por arquivo (observability/dashboards/), não por
+  # import manual via UI — docker compose up --build já entrega o dashboard
+  # pronto em qualquer máquina (ARCHITECTURE.md).
+  grafana:
+    image: grafana/grafana:11.3.1
+    volumes:
+      - ./observability/grafana-provisioning:/etc/grafana/provisioning:ro
+      - ./observability/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+      - loki
+
 volumes:
   postgres_data:

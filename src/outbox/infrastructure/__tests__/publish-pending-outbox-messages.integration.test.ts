@@ -77,6 +77,8 @@ describe('PublishPendingOutboxMessagesUseCase — happy path (real Postgres + re
     expect(result.claimed).toBe(1);
     expect(result.published).toBe(1);
     expect(result.failed).toBe(0);
+    // FakeClock(AT) fixo + occurredAt do evento seedado também AT → lag zero.
+    expect(result.publishedLagsSeconds).toEqual([0]);
 
     const row = await orm.em.fork().findOneOrFail(OutboxMessageRow, { id: messageId });
     expect(row.publishedAt).toEqual(AT);
@@ -91,7 +93,7 @@ describe('PublishPendingOutboxMessagesUseCase — happy path (real Postgres + re
 
   it('claims nothing when there are no pending messages', async () => {
     const result = await newUseCase().execute();
-    expect(result).toEqual({ claimed: 0, published: 0, failed: 0 });
+    expect(result).toEqual({ claimed: 0, published: 0, failed: 0, publishedLagsSeconds: [] });
   });
 
   it('does not claim a message whose next_attempt_at is in the future', async () => {

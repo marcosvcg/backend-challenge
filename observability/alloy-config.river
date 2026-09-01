@@ -1,0 +1,36 @@
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+// Promove metadata Docker/Compose para labels Loki de baixa cardinalidade —
+// compose_service (com.docker.compose.service) e container (nome do
+// container) — para que {compose_service="app"} isole logs da aplicação de
+// ruído de infraestrutura (localstack/postgres/loki/...), sem nunca tocar em
+// identificadores de alta cardinalidade (correlationId/transactionId/
+// walletId/messageId/providerId permanecem só dentro do JSON estruturado).
+discovery.relabel "container_labels" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "app_logs" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.container_labels.output
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

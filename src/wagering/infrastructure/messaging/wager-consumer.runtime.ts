@@ -4,7 +4,9 @@ import { ProcessWagerTransactionUseCase } from '../../application/process-wager-
 import { SqsQueueUrlResolver } from '../../../shared/infrastructure/messaging/sqs-queue-url-resolver';
 import { createSqsClient } from '../../../shared/infrastructure/messaging/sqs-client-factory';
 import type { Logger } from '../../../shared/application/logger';
-import { LOGGER } from '../../../shared/infrastructure/shared.tokens';
+import type { MetricsPort } from '../../../shared/application/metrics';
+import type { Clock } from '../../../shared/application/clock';
+import { LOGGER, METRICS, CLOCK } from '../../../shared/infrastructure/shared.tokens';
 
 /** Liga/desliga WagerTransactionConsumer ao lifecycle real do processo Nest —
  *  o consumer em si (start()/stop(), loop de long-polling) já existia e não
@@ -29,6 +31,8 @@ export class WagerConsumerRuntime implements OnApplicationBootstrap, OnApplicati
     private readonly useCase: ProcessWagerTransactionUseCase,
     private readonly queueUrlResolver: SqsQueueUrlResolver,
     @Inject(LOGGER) private readonly logger: Logger,
+    @Inject(METRICS) private readonly metrics: MetricsPort,
+    @Inject(CLOCK) private readonly clock: Clock,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -55,7 +59,15 @@ export class WagerConsumerRuntime implements OnApplicationBootstrap, OnApplicati
     // this.logger (Logger compartilhado) satisfaz WagerTransactionConsumerLogger
     // estruturalmente (mesmos 3 métodos, mesma assinatura) — não migra o tipo
     // do consumer, só evita instanciar um segundo console.log duplicado.
-    this.consumer = new WagerTransactionConsumer(client, queueUrl, this.useCase, this.logger, waitTimeSeconds);
+    this.consumer = new WagerTransactionConsumer(
+      client,
+      queueUrl,
+      this.useCase,
+      this.logger,
+      waitTimeSeconds,
+      this.metrics,
+      this.clock,
+    );
     this.consumer.start();
     this.logger.info('WagerTransactionConsumer started', { queueUrl, waitTimeSeconds });
   }

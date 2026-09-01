@@ -70,15 +70,25 @@ services:
       localstack:
         condition: service_healthy
 
-  # API HTTP + os 3 workers assíncronos (WagerTransactionConsumer,
-  # OutboxPublisherRuntime, PendingReferenceRuntime) — o sistema operacional
-  # completo, não só a camada HTTP. Só sobe depois que schema E filas
-  # existem de fato (service_completed_successfully), nunca torcendo para um
-  # setup manual ter rodado antes (ARCHITECTURE.md).
+  # API HTTP + os 4 workers assíncronos (WagerTransactionConsumer,
+  # OutboxPublisherRuntime, PendingReferenceRuntime, DlqGaugeRuntime) — o
+  # sistema operacional completo, não só a camada HTTP. Só sobe depois que
+  # schema E filas existem de fato (service_completed_successfully), nunca
+  # torcendo para um setup manual ter rodado antes (ARCHITECTURE.md).
+  #
+  # Sem `ports:` mapeado para o host — `docker compose up --scale app=N`
+  # (validação multi-instância, ARCHITECTURE.md) falharia por conflito de
+  # porta se N > 1 tentasse publicar todas na mesma 3000 do host. Cada
+  # réplica continua ouvindo em 3000 dentro da rede Docker interna
+  # (alcançável por qualquer outro serviço via DNS round-robin do Compose no
+  # nome `app`, e por scripts de verificação via `docker compose exec`/
+  # `docker inspect` para descobrir o IP de uma réplica específica); acesso
+  # HTTP direto do host a uma réplica nomeada não é um requisito — os testes
+  # sistêmicos multi-instância exercitam o use case/SQS diretamente. Ambiente
+  # de instância única (`docker compose up` sem --scale) usa
+  # `docker compose exec app curl localhost:3000/...` para inspeção manual.
   app:
     build: .
-    ports:
-      - "3000:3000"
     environment:
       DATABASE_HOST: postgres
       SQS_ENDPOINT: http://localstack:4566

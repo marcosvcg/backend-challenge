@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { MikroORM } from '@mikro-orm/postgresql';
-import { ReceiveMessageCommand, SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
+import { DeleteMessageCommand, ReceiveMessageCommand, SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { randomUUID } from 'node:crypto';
 import { createTestOrm, truncateAllTables } from '../../../shared/__test-support__/test-orm';
 import { setupTestInboundQueue, teardownTestQueue } from '../../../shared/__test-support__/test-inbound-queue';
@@ -226,6 +226,88 @@ describe('WagerTransactionConsumer — integration (real Postgres + real LocalSt
     const redelivered = await findByExternalTransactionId(client, queueUrl, externalTransactionId);
     expect(redelivered).toBeDefined();
   }, 10000);
+
+  it('crash/restart scenario (item 7): financial commit succeeds but ACK never happens — redelivery of the SAME message never double-debits (Inbox + idempotencyKey catch it)', async () => {
+    // Wraps a REAL SQSClient — ReceiveMessageCommand/SendMessageCommand
+    // delegate untouched (real LocalStack traffic). Only DeleteMessageCommand
+    // (the ACK) is intercepted, failing exactly once. This simulates the
+    // exact window item 7 asks for: the financial transaction has already
+    // committed (useCase.execute() already resolved with a PROCESSED result)
+    // by the time ack() is reached — a real network blip/crash between "SQL
+    // commit succeeded" and "DeleteMessageCommand succeeded" is
+    // indistinguishable from this at the consumer's boundary.
+    let deleteAttempts = 0;
+    const real = sqsClient();
+    const flakyAckClient = {
+      send: (command: unknown) => {
+        if (command instanceof DeleteMessageCommand) {
+          deleteAttempts += 1;
+          if (deleteAttempts === 1) {
+            throw new Error('Simulated crash: DeleteMessageCommand never reached SQS (network blip / process killed right after commit).');
+          }
+        }
+        return real.send(command as never);
+      },
+    } as unknown as SQSClient;
+
+    const walletId = await seedWallet(orm, '100.00');
+    const client = sqsClient();
+    const externalTransactionId = randomUUID();
+    await client.send(
+      new SendMessageCommand({
+        QueueUrl: queueUrl,
+        MessageBody: betMessageBody({ walletId, externalTransactionId }),
+        MessageGroupId: randomUUID(),
+        MessageDeduplicationId: randomUUID(),
+      }),
+    );
+
+    const runner = new MikroOrmTransactionRunner(orm.em);
+    const useCase = new ProcessWagerTransactionUseCase(
+      runner,
+      new UuidIdGenerator(),
+      new FakeClock(AT),
+      DEFAULT_REFERENCE_RETRY_POLICY,
+    );
+    const consumer = new WagerTransactionConsumer(flakyAckClient, queueUrl, useCase, silentLogger(), 1);
+
+    consumer.start();
+    // First attempt: useCase.execute() commits (PROCESSED, wallet debited),
+    // then ack() throws — the consumer's outer catch classifies this as
+    // transient (an unrecognized AWS error, not one of
+    // KNOWN_STRUCTURAL_ERRORS) and never ACKs, exactly as production code
+    // already does for any unexpected error at this point (no special-casing
+    // was added for this scenario — this test proves the EXISTING behavior
+    // is already correct here).
+    await new Promise((resolve) => setTimeout(resolve, 800));
+
+    const walletMidCrash = await orm.em.fork().findOneOrFail(WalletRow, { id: walletId });
+    expect(walletMidCrash.balanceAmount).toBe('70.00'); // the financial commit really happened
+
+    // Visibility timeout (2s) expires — SQS redelivers the SAME message
+    // (same SQS MessageId, same body/idempotencyKey). Second attempt:
+    // Inbox.tryClaim() for this MessageId is isNew (first delivery attempt's
+    // whole transaction, including the Inbox insert, committed successfully —
+    // only the ACK failed afterwards) → already-acked, OR (if for some reason
+    // the Inbox row's own commit hadn't been visible yet) idempotencyKey
+    // matches the already-persisted WagerTransaction → replay. Either path:
+    // no second debit. DeleteMessageCommand succeeds this time (deleteAttempts
+    // now >= 2), so the message finally leaves the queue.
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await consumer.stop();
+
+    expect(deleteAttempts).toBeGreaterThanOrEqual(2); // proves a real redelivery cycle happened, not a fluke
+
+    const walletFinal = await orm.em.fork().findOneOrFail(WalletRow, { id: walletId });
+    expect(walletFinal.balanceAmount).toBe('70.00'); // still exactly one debit — redelivery never doubled it
+
+    const txCount = await orm.em.fork().count(WagerTransactionRow, { walletId });
+    expect(txCount).toBe(1); // exactly one WagerTransaction row, despite two delivery attempts of the same message
+
+    // The message eventually left the queue once ACK finally succeeded.
+    const stillOnQueue = await findByExternalTransactionId(client, queueUrl, externalTransactionId, 1);
+    expect(stillOnQueue).toBeUndefined();
+  }, 15000);
 
   it('moves a message to the DLQ after maxReceiveCount failed attempts', async () => {
     const walletId = randomUUID(); // does not exist — every attempt fails transiently

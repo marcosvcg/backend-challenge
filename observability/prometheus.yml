@@ -2,7 +2,20 @@ global:
   scrape_interval: 15s
 
 scrape_configs:
+  # dns_sd_configs (type: A), não static_configs: com `docker compose up
+  # --scale app=N`, o nome `app` resolve para N registros A distintos (uma
+  # entrada por réplica) no DNS interno do Compose. static_configs faz uma
+  # única resolução na inicialização (ou usa cache do resolver), então só
+  # enxergaria 1 das N réplicas; dns_sd_configs reconsulta o DNS a cada
+  # refresh_interval e faz scrape de CADA endereço A resolvido
+  # individualmente — confirmado empiricamente com 3 réplicas
+  # (ARCHITECTURE.md): count(up{job="app"}) == 3, cada série com um
+  # `instance` (IP:porta) distinto. Docker DNS nativo — nenhum service
+  # discovery externo introduzido.
   - job_name: app
-    static_configs:
-      - targets: ["app:3000"]
+    dns_sd_configs:
+      - names: ["app"]
+        type: A
+        port: 3000
+        refresh_interval: 15s
     metrics_path: /metrics

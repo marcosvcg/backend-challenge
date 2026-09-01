@@ -1377,3 +1377,100 @@ Confundir os dois primeiros faria o Inbox deduplicar pela identidade errada — 
 6. `/metrics` real: `wager_transactions_total{status="processed",origin="queue"} 1` (só a válida contou — instrumentação continua acontecendo só depois de `execute()` resolver, nunca para os casos malformed que lançam antes disso), `sqs_message_redeliveries_total` refletindo o redrive nativo já em andamento sobre as mensagens malformed.
 
 Suíte completa: 333 pass / 0 fail (290 + 43 novos — 8 `wager-transaction` domínio + 9 `parse-wager-transaction-message` + 6 `canonical-wager-payload` + 2 `process-wager-transaction.integration` Inbox/idempotency + 15 `wager-transaction.consumer.integration` malformed/regressão + 3 `cross-transport-idempotency`). `bun run build`: limpo. Validado repetidamente sem falhas (ver acima) — inclui a rodada final pós-correção do achado 2c (`required`/`forbidden`) e a rodada final pós-fechamento da lacuna do `WIN` (`optional`): `wager-transaction.test.ts` isolado, `process-wager-transaction.integration.test.ts` isolado, `wager-transaction.consumer.integration.test.ts` isolado, `cross-transport-idempotency.integration.test.ts` isolado, e a suíte completa — todos verdes em ambas as rodadas.
+
+## 34. Validação multi-instância — 3 processos reais, prova eliminatória final
+
+**Objetivo:** provar que a solução é correta com ≥3 instâncias reais e simultâneas compartilhando o mesmo Postgres, a mesma fila SQS inbound, a mesma fila/outbox outbound e os mesmos recursos LocalStack — não 3 objetos dentro do mesmo processo, não testes sequenciais disfarçados de concorrentes.
+
+### `docker compose up --build --scale app=3` — dois ajustes mínimos de infraestrutura
+
+Auditoria confirmou exatamente os dois pontos que impediam `--scale app=N > 1`, ambos corrigidos com a menor mudança possível:
+
+- **`docker-compose.yml`**: `ports: ["3000:3000"]` no serviço `app` removido — publicar a mesma porta do host para N réplicas é um conflito estrutural, não contornável sem introduzir um proxy/load balancer (explicitamente fora de escopo). Cada réplica continua ouvindo em `3000` na rede Docker interna, alcançável por qualquer outro serviço via o DNS round-robin nativo do Compose no nome `app`; verificação/demonstração manual usa `docker exec <container> bun -e "await fetch('http://localhost:3000/...')"` (o container não tem `curl`) para garantir que uma chamada específica atinge um processo determinado, quando isso importa para a prova (ex.: os cenários de race abaixo, disparados deliberadamente via réplicas diferentes).
+- **`observability/prometheus.yml`**: `static_configs: targets: ["app:3000"]` trocado por `dns_sd_configs` (`type: A`, `refresh_interval: 15s`). `static_configs` resolve o nome uma única vez (ou usa cache do resolver) — com `--scale app=3`, o nome `app` resolve para 3 registros A distintos, mas uma resolução estática só capturaria 1 deles. `dns_sd_configs` reconsulta o DNS periodicamente e faz scrape de **cada** endereço resolvido individualmente. Confirmado empiricamente (ver item 9 abaixo).
+
+`docker compose up --build --scale app=3` funcionou de primeira depois dos dois ajustes — nenhuma infraestrutura nova (sem Kubernetes, sem load balancer, sem service discovery externo), só o DNS/scale nativos do Compose.
+
+### 1–2. Três instâncias reais + prova eliminatória de concorrência financeira (100 − 80 − 80)
+
+3 containers `app` reais e independentes confirmados via `docker compose ps` (`app-1`/`app-2`/`app-3`, cada um logando o boot dos seus 4 workers separadamente). Cenário executado contra uma wallet real (saldo `100.00`), as duas apostas de `80.00` disparadas **genuinamente em paralelo** (dois `docker exec` em background, cada um contra um container `app` diferente — nenhuma serialização artificial no teste, a única serialização real é o `PESSIMISTIC_WRITE` do Postgres) via `app-2` e `app-3`:
+
+- `app-2`: `PROCESSED`.
+- `app-3`: `REJECTED`, `InsufficientBalanceError`.
+- Confirmado via SQL direto: `wallet.balance_amount = 20.00`, `wallet.version = 3` (abertura + o único débito real — a rejeição nunca escreve), exatamente 1 linha `wallet_ledger_entry` `DEBIT` de `80.00` (`balance_before: 100.00 → balance_after: 20.00`), nenhum saldo negativo em nenhum ponto.
+
+### 3. Idempotência entre instâncias
+
+Mesma `idempotencyKey`/payload disparados **concorrentemente** via `app-1`/`app-2`/`app-3` (3 requisições simultâneas, uma por instância): `app-1` → `idempotentReplay: false` (processamento original), `app-2`/`app-3` → `idempotentReplay: true`, mesmo `transactionId` nas 3 respostas. Mesma key + payload diferente, via uma 4ª instância: `409`, saldo/`version`/contagem de `wager_transaction` inalterados no banco.
+
+### 4. Inbox multi-instância — achado real: uma race genuína entre `SELECT` e `INSERT` concorrentes, resolvida corretamente pela constraint + redrive nativo
+
+Duas mensagens SQS reais enviadas com `MessageDeduplicationId` distintos (forçando o LocalStack a atribuir dois `Message.MessageId` genuinamente diferentes), mesma `idempotencyKey`, mesmo payload. As duas foram recebidas por **instâncias diferentes quase simultaneamente** (ambas em long-polling, `waitTimeSeconds=10`) — e isso expôs uma race real, não hipotética: `app-1` processou a primeira entrega e commitou (`PROCESSED`, ACKada); `app-2`, processando a segunda entrega concorrentemente, teve seu `Inbox.tryClaim()` corretamente avaliado como `isNew: true` (é uma entrega diferente — correto), mas ao tentar **criar** a `WagerTransaction` (porque seu próprio `findByIdempotencyKey()`, executado *antes* do commit de `app-1` se tornar visível, não encontrou nada ainda), colidiu na constraint real do banco `wt_idempotency_key_unique` — a defesa de última linha contra exatamente essa janela de `check-then-act` entre duas transações concorrentes.
+
+Esse erro de violação de constraint (não reconhecido como um dos 5 `KNOWN_STRUCTURAL_ERRORS`) foi classificado como transient — nunca ACKada. O SQS reentregou a **mesma mensagem** (mesmo `Message.MessageId`, confirmado nos logs) ~30s depois; na segunda tentativa, `findByIdempotencyKey()` já encontrava a linha (agora commitada e visível), retornou `replay`, e o Inbox fechou o ciclo (`markProcessed`, ACK). Resultado final confirmado no banco: exatamente 1 `WagerTransaction`, saldo movido uma única vez, apesar de 2 entregas SQS distintas processadas por 2 processos diferentes competindo dentro da mesma janela de milissegundos. Nenhuma intervenção manual foi necessária — o mecanismo existente (constraint + classificação transient + redrive nativo do SQS) resolveu a race sozinho, exatamente como a garantia at-least-once + idempotência promete.
+
+### 5. Outbox com múltiplos publishers
+
+Já integralmente coberto por teste automatizado pré-existente contra Postgres+SQS reais (`publish-pending-outbox-messages.integration.test.ts`, não reimplementado, só confirmado ainda válido — 8/8 passando com a stack de 3 instâncias reais rodando simultaneamente sobre o mesmo Postgres/LocalStack): `two concurrent publishers never process the same row simultaneously` (`FOR UPDATE SKIP LOCKED`, 2 runners reais, 20 mensagens, 6 rounds concorrentes, `totalClaimed === totalPublished === 20`, nenhuma linha reivindicada duas vezes), `event published uses outbox_message.id as eventId` (eventId estável = row id, nunca regenerado), `at-least-once semantics: crash after SQS send but before commit ... can duplicate on retry` (duplicidade aceitável documentada, nenhum evento perdido), `never publishes before the financial transaction ... committed`. Evidência real adicional: com os 3 `OutboxPublisherRuntime` reais rodando durante toda a sessão de verificação, `outbox_message` terminou com 100% das linhas `published_at IS NOT NULL`, `attempts = 0` em todas — nenhuma perda, nenhum retry necessário mesmo sob 3 publishers reais competindo continuamente.
+
+### 6. Pending Reference concorrente
+
+Já integralmente coberto por teste automatizado pré-existente (`retry-pending-references.integration.test.ts`, `'two concurrent worker instances never resolve the same pending reference twice'`, 8/8 passando): 2 workers reais (`EntityManager` forks distintos) competem via `Promise.all()` por uma mesma `PENDING_REFERENCE`, exatamente 1 resolve, saldo final correto, exatamente 1 ledger `CREDIT`. Evidência real adicional: cenário reproduzido com os 3 `PendingReferenceRuntime` reais da stack (REFUND `PENDING_REFERENCE` real via `app-2`, BET resolvendo a referência via `app-3`, um dos 3 workers reais resolveu no ciclo seguinte) — confirmado no banco: `pending-ref-refund-1` transicionou para `PROCESSED`, exatamente 3 linhas de ledger (`CREDIT` abertura, `DEBIT` bet, `CREDIT` refund — cada uma uma única vez), `wallet.version = 4` (um incremento por movimento real, nenhum duplicado).
+
+### 7. Crash/restart — os dois cenários críticos
+
+**Cenário 2 (evento outbox enviado, row ainda não marcada `published`)**: já coberto pelo teste pré-existente citado no item 5 (`at-least-once semantics: crash after SQS send but before commit`) — executado e confirmado 8/8 junto da stack multi-instância.
+
+**Cenário 1 (commit financeiro aconteceu, ACK SQS não aconteceu)**: não havia teste dedicado a esse cenário específico — os testes existentes de redelivery cobriam falha **antes** do commit (nunca comita), não o commit já ter sucedido com falha **depois**, no ACK. Novo teste, `'crash/restart scenario (item 7): financial commit succeeds but ACK never happens'` (`wager-transaction.consumer.integration.test.ts`, real Postgres + real LocalStack SQS): envolve um `SQSClient` real (delegando `ReceiveMessageCommand`/`SendMessageCommand` sem alteração) mas com `DeleteMessageCommand` interceptado para falhar exatamente uma vez, simulando a janela exata entre "commit SQL sucedeu" e "ACK sucedeu". Primeira tentativa: `useCase.execute()` comita de verdade (saldo debitado, confirmado no banco *durante* o teste, antes de qualquer redelivery), `ack()` lança, classificado como transient pelo comportamento **já existente** (nenhuma mudança de produção foi necessária — este teste só prova que o código já era correto aqui), nunca ACKa. Visibility timeout expira, SQS reentrega a mesma mensagem; segunda tentativa: Inbox/idempotencyKey reconhecem a entrega, `ack()` sucede desta vez. Resultado: saldo debitado **exatamente uma vez**, exatamente 1 `WagerTransaction`, mensagem finalmente sai da fila.
+
+### 8. Invariante final do ledger
+
+`POST /wallets/:walletId/reconciliation` na wallet do cenário 100−80−80: `{"difference": "0.00", "consistent": true}` — real, contra Postgres real, depois da race financeira genuína.
+
+### 9. Prometheus em multi-instância
+
+`count(up{job="app"}) == 3` confirmado via a API real do Prometheus, contra a stack de 3 réplicas real — 3 séries `up`, `instance` distintos (`172.19.0.5:3000`, `.6:3000`, `.7:3000`), `value: 1` nas três. `sum by (instance) (wager_transactions_total)` confirma tráfego genuinamente distribuído entre as 3 (`4`, `4`, `3` transações por instância no momento da verificação) — não uma réplica ociosa enquanto as outras processam tudo. `histogram_quantile(0.95, sum by (le, origin) (...))` (a mesma query do dashboard, seção 32) confirmado agregando corretamente as 3 réplicas numa única série por `origin`, com dados reais de tráfego real distribuído.
+
+### 10. Decisão final — `wallet_lock_conflicts_total`: não criada, com justificativa
+
+Auditoria de código confirmou, antes de qualquer decisão: `PESSIMISTIC_WRITE` (`FOR UPDATE`, bloqueante) é usado em exatamente um ponto — `MikroOrmWalletRepository.findByIdForUpdate()` — chamado **no máximo uma vez por transação financeira**, sempre para uma única wallet (nunca duas wallets lockadas na mesma transação, em nenhuma ordem). Nenhum nível de isolamento além do default (`READ COMMITTED`) é configurado em nenhum lugar do código. Sob essas duas condições:
+
+- **`40P01` (deadlock_detected)**: exigiria duas transações esperando uma pela outra em ciclo — só possível se alguma transação lockasse ≥2 recursos em ordens diferentes de outra. O padrão de acesso atual (1 wallet por transação, nunca mais) estruturalmente não forma esse ciclo.
+- **`55P03` (lock_not_available)**: só ocorre com `NOWAIT` explícito — não usado em nenhum lock deste projeto.
+- **`40001` (serialization_failure)**: só ocorre em isolamento `SERIALIZABLE`/`REPEATABLE READ` com conflito de escrita detectado — o projeto roda inteiramente em `READ COMMITTED`.
+
+Nenhum dos três códigos é alcançável de forma real e observável com a estratégia de locking atual, sem alterá-la (o que está fora de escopo deste incremento). Criar `wallet_lock_conflicts_total` sem um ponto real de incremento seria exatamente a métrica falsa que a diretriz do usuário proibiu explicitamente. Decisão final: **não criada**. `wallet_lock_acquisition_duration_seconds` permanece como está, com a semântica já documentada explicitamente desde a seção 31 e reforçada aqui:
+
+```
+duration = contention/wait visibility — PESSIMISTIC_WRITE espera, nunca falha
+counter (wallet_lock_conflicts_total) = não implementada — nenhum erro real
+  de lock/deadlock/serialization é observável hoje sem mudar a estratégia
+  de locking (auditado: nenhum caminho do código produz 40P01/55P03/40001)
+```
+
+Se a estratégia de locking mudar no futuro (ex.: múltiplos locks por transação, `NOWAIT`, isolamento mais estrito), esta decisão deve ser revisitada — não antes.
+
+### 11. Tabela de auditoria das falhas eliminatórias (README seção "Falhas eliminatórias")
+
+| Requisito eliminatório | Mecanismo | Teste/evidência | Status |
+|---|---|---|---|
+| `number` para dinheiro | `Money` usa `Decimal` (decimal.js) sobre `string`, nunca `number`/`float` | Auditoria de código: zero ocorrências de `number`/`parseFloat`/`Number(amount)` no domínio; `money.test.ts` (29 casos) | **PASS** |
+| Saldo negativo causado por race | `PESSIMISTIC_WRITE` (`FOR UPDATE`) serializa acesso por `walletId`; `Wallet.debit()` valida saldo suficiente antes de aplicar | Cenário 100−80−80 real, 3 instâncias, race genuína (item 1–2 acima): saldo final `20.00`, nunca negativo, confirmado no Postgres | **PASS** |
+| Débito/crédito duplicado | Inbox (`(consumerName, messageId)` UNIQUE) + idempotência financeira (`idempotencyKey` UNIQUE) em duas camadas distintas | Item 3 (idempotência concorrente) + item 4 (Inbox multi-instância, incluindo a race real de constraint) + item 7 (crash pós-commit/pré-ACK) — todos confirmados: exatamente um efeito financeiro em cada cenário | **PASS** |
+| Idempotência apenas em memória | `idempotencyKey`/`payloadHash` persistidos em `wager_transaction` (UNIQUE), Inbox persistido em `inbox_message` (UNIQUE) — nenhum estado de dedupe em variável de processo | Item 3/4: idempotência sobrevive entre 3 processos *diferentes*, nunca compartilhando memória | **PASS** |
+| Solução correta somente com uma instância | `docker compose up --build --scale app=3` funcional; todos os cenários acima (1–9) executados com 3 processos reais e simultâneos | Toda a seção 34 | **PASS** |
+| Publicação de evento antes do commit | Outbox insere na mesma transação SQL da escrita financeira; publisher só enxerga linhas já commitadas | Teste pré-existente `never publishes before the financial transaction ... committed` (item 5) | **PASS** |
+| Ausência de ledger auditável | `wallet_ledger_entry` imutável (sem update/delete no código), FK para `wager_transaction`, `isBalanced()` validado na criação | Item 2 (ledger real do cenário de race) + item 8 (`reconciliation`, `difference: 0.00`) | **PASS** |
+| Testes que substituem completamente Postgres/SQS por mocks | Todos os 17 arquivos `*.integration.test.ts` do projeto usam `createTestOrm()`/LocalStack reais — nenhum mock de infraestrutura nos testes de integração | Auditoria de arquivos: 17/17 `.integration.test.ts` confirmados usando infra real; suíte completa (334 testes) roda contra Postgres/LocalStack reais | **PASS** |
+
+Nenhum `BLOCKER`.
+
+### Testes finais
+
+`bun test`: 334 pass / 0 fail (333 + 1 novo, o teste de crash/restart do item 7). `bun run build`: limpo. `docker compose up --build` (sem `--scale`, 1 réplica): boot limpo, confirmado. `docker compose up --build --scale app=3`: boot limpo, 3 réplicas reais confirmadas, confirmado duas vezes nesta sessão (verificação inicial + re-subida para o estado final da entrega).
+
+### Limitações conhecidas, aceitas e documentadas (não são gaps escondidos)
+
+- Sem `ports:` publicado para `app` no Compose — acesso HTTP direto do host a uma réplica nomeada não é possível sem `docker exec`/inspeção de IP interno. Deliberado (ver acima) para permitir `--scale`; um proxy/gateway ficaria fora do escopo pedido ("não introduza load balancer complexo").
+- `wallet_lock_conflicts_total` não implementada — decisão justificada no item 10, não uma pendência.
+- Autenticação — decisão já registrada em incremento anterior (README seção 2, não obrigatória), não revisitada aqui.

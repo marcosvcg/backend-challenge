@@ -75,5 +75,23 @@ export function parseWagerTransactionMessage(rawBody: string): WagerTransactionR
     throw new MalformedWagerTransactionMessageError('missing or invalid data.money');
   }
 
+  // referenceExternalTransactionId presente mas vazio/whitespace: rejeitado
+  // aqui, nunca deixado passar como "ausente" para WagerTransaction.create().
+  // Achado real de auditoria (hardening SQS): '' é !== undefined, então
+  // WagerTransaction.assertReferenceRequirement() a aceita como "presente" —
+  // mas o use case usa `if (cmd.referenceExternalTransactionId)` (checagem
+  // truthy) para decidir se resolve a referência, e '' é falsy. O resultado
+  // sem este guard: um REFUND com referência '' cria uma WagerTransaction
+  // válida (create() não reclama) mas NUNCA resolve/valida a referência —
+  // aplicando o efeito de saldo do REFUND (Credit) sem que a referência
+  // tenha sido validada. Mesma barreira que o HTTP já tem via
+  // ReferenceRequirementMatchesKindConstraint.isWellFormedString (length > 0).
+  if (
+    data.referenceExternalTransactionId !== undefined &&
+    (typeof data.referenceExternalTransactionId !== 'string' || data.referenceExternalTransactionId.trim().length === 0)
+  ) {
+    throw new MalformedWagerTransactionMessageError('data.referenceExternalTransactionId, when present, must be a non-blank string');
+  }
+
   return parsed as WagerTransactionRequestedMessage;
 }

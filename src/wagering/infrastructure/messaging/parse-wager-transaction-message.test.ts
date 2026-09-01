@@ -36,6 +36,35 @@ describe('parseWagerTransactionMessage — valid message', () => {
   });
 });
 
+/** Achado real de auditoria (hardening SQS): '' é !== undefined, então sem
+ *  este guard WagerTransaction.assertReferenceRequirement() a aceitaria como
+ *  "presente" — mas o use case usa `if (cmd.referenceExternalTransactionId)`
+ *  (truthy) para decidir se resolve a referência, e '' é falsy. Sem esta
+ *  checagem no parser, um REFUND com referência '' criaria uma
+ *  WagerTransaction válida sem NUNCA resolver/validar a referência,
+ *  aplicando o efeito de saldo do REFUND (Credit) de qualquer forma —
+ *  confirmado empiricamente antes desta correção (teste de integração do
+ *  consumer: saldo movido, WagerTransaction criada). */
+describe('parseWagerTransactionMessage — referenceExternalTransactionId, when present, must be non-blank', () => {
+  it('rejects an empty string', () => {
+    expect(() =>
+      parseWagerTransactionMessage(validBody({ kind: 'REFUND', referenceExternalTransactionId: '' })),
+    ).toThrow(MalformedWagerTransactionMessageError);
+  });
+
+  it('rejects a whitespace-only string', () => {
+    expect(() =>
+      parseWagerTransactionMessage(validBody({ kind: 'REFUND', referenceExternalTransactionId: '   ' })),
+    ).toThrow(MalformedWagerTransactionMessageError);
+  });
+
+  it('rejects a non-string value', () => {
+    expect(() =>
+      parseWagerTransactionMessage(validBody({ kind: 'REFUND', referenceExternalTransactionId: 123 })),
+    ).toThrow(MalformedWagerTransactionMessageError);
+  });
+});
+
 describe('parseWagerTransactionMessage — structural errors (permanent, never ACK)', () => {
   it('rejects invalid JSON', () => {
     expect(() => parseWagerTransactionMessage('not json{{{')).toThrow(MalformedWagerTransactionMessageError);
@@ -88,5 +117,40 @@ describe('parseWagerTransactionMessage — structural errors (permanent, never A
     expect(() => parseWagerTransactionMessage(validBody({ money: { amount: 25, currency: 'BRL' } }))).toThrow(
       MalformedWagerTransactionMessageError,
     );
+  });
+
+  it('rejects a required field with the wrong type (e.g. providerId as a number)', () => {
+    const parsed = JSON.parse(validBody());
+    parsed.data.providerId = 123;
+    expect(() => parseWagerTransactionMessage(JSON.stringify(parsed))).toThrow(MalformedWagerTransactionMessageError);
+  });
+
+  it('rejects an empty string in a required field', () => {
+    expect(() => parseWagerTransactionMessage(validBody({ gameId: '' }))).toThrow(
+      MalformedWagerTransactionMessageError,
+    );
+  });
+});
+
+/** Notação científica/mais de 2 casas decimais/currency inválida: o parser só
+ *  checa shape (money é um objeto com amount/currency string) — a validação
+ *  lexical real do valor é responsabilidade de Money.from(), chamada no
+ *  mapper (wagerTransactionMessageToCommand), não do parser. Estes casos
+ *  passam pelo parser sem erro (comportamento correto — não é um erro de
+ *  shape) e são cobertos como erros de domínio abaixo/no teste de integração
+ *  do consumer, que prova o resultado observável fim-a-fim: permanent, sem
+ *  mutação financeira, não importa em qual camada a rejeição de fato
+ *  acontece. */
+describe('parseWagerTransactionMessage — lexical amount/currency validity is NOT this parser\'s responsibility', () => {
+  it('scientific notation in amount passes shape validation (Money.from() rejects it later)', () => {
+    expect(() => parseWagerTransactionMessage(validBody({ money: { amount: '2.5e1', currency: 'BRL' } }))).not.toThrow();
+  });
+
+  it('more than 2 decimal places passes shape validation (Money.from() rejects it later)', () => {
+    expect(() => parseWagerTransactionMessage(validBody({ money: { amount: '25.001', currency: 'BRL' } }))).not.toThrow();
+  });
+
+  it('an invalid currency code passes shape validation (Money.from() rejects it later)', () => {
+    expect(() => parseWagerTransactionMessage(validBody({ money: { amount: '25.00', currency: 'brl' } }))).not.toThrow();
   });
 });

@@ -6,7 +6,9 @@ import { WagerBalanceEffect } from './wager-balance-effect';
 import {
   IncompatibleReferenceError,
   InvalidReferenceKindError,
+  InvalidReferenceValueError,
   InvalidTransactionStateError,
+  InvalidWagerAmountError,
   MissingReferenceError,
   UnexpectedReferenceError,
 } from './wagering.errors';
@@ -59,13 +61,25 @@ describe('WagerTransaction.create — reference requirement by kind', () => {
     ).toThrow(UnexpectedReferenceError);
   });
 
-  it('REFUND requires a reference', () => {
+  it('REFUND requires a reference (undefined)', () => {
     expect(() => WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Refund }))).toThrow(
       MissingReferenceError,
     );
   });
 
-  it('REFUND with a reference is accepted', () => {
+  it('REFUND with an empty-string reference is rejected — never treated as "absent" (hardening SQS regression)', () => {
+    expect(() =>
+      WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: '' })),
+    ).toThrow(MissingReferenceError);
+  });
+
+  it('REFUND with a whitespace-only reference is rejected (hardening SQS regression)', () => {
+    expect(() =>
+      WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: '   ' })),
+    ).toThrow(MissingReferenceError);
+  });
+
+  it('REFUND with a valid reference is accepted', () => {
     expect(() =>
       WagerTransaction.create(
         baseProps({ kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'ext-0' }),
@@ -73,21 +87,59 @@ describe('WagerTransaction.create — reference requirement by kind', () => {
     ).not.toThrow();
   });
 
-  it('ROLLBACK requires a reference', () => {
+  it('ROLLBACK requires a reference (undefined)', () => {
     expect(() => WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Rollback }))).toThrow(
       MissingReferenceError,
     );
   });
 
-  it('WIN without a reference is accepted (optional)', () => {
+  it('ROLLBACK with an empty-string reference is rejected — never treated as "absent" (hardening SQS regression)', () => {
+    expect(() =>
+      WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Rollback, referenceExternalTransactionId: '' })),
+    ).toThrow(MissingReferenceError);
+  });
+
+  it('WIN without a reference (undefined) is accepted (optional)', () => {
     expect(() => WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Win }))).not.toThrow();
   });
 
-  it('WIN with a reference is accepted (optional)', () => {
+  it('WIN with a valid reference is accepted (optional)', () => {
     expect(() =>
       WagerTransaction.create(
         baseProps({ kind: WagerTransactionKind.Win, referenceExternalTransactionId: 'ext-0' }),
       ),
+    ).not.toThrow();
+  });
+
+  it('WIN with an empty-string reference is rejected — undefined would be fine, but a defined-and-blank value is not', () => {
+    expect(() =>
+      WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Win, referenceExternalTransactionId: '' })),
+    ).toThrow(InvalidReferenceValueError);
+  });
+
+  it('WIN with a whitespace-only reference is rejected', () => {
+    expect(() =>
+      WagerTransaction.create(baseProps({ kind: WagerTransactionKind.Win, referenceExternalTransactionId: '   ' })),
+    ).toThrow(InvalidReferenceValueError);
+  });
+});
+
+describe('WagerTransaction.create — amount must be strictly positive (invariant of WagerTransaction, not Money)', () => {
+  it('amount 0.00 is rejected with InvalidWagerAmountError', () => {
+    expect(() =>
+      WagerTransaction.create(baseProps({ money: Money.from({ amount: '0.00', currency: 'BRL' }) })),
+    ).toThrow(InvalidWagerAmountError);
+  });
+
+  it('a negative amount is rejected with InvalidWagerAmountError', () => {
+    expect(() =>
+      WagerTransaction.create(baseProps({ money: Money.from({ amount: '-10.00', currency: 'BRL' }) })),
+    ).toThrow(InvalidWagerAmountError);
+  });
+
+  it('a positive amount is accepted', () => {
+    expect(() =>
+      WagerTransaction.create(baseProps({ money: Money.from({ amount: '0.01', currency: 'BRL' }) })),
     ).not.toThrow();
   });
 });

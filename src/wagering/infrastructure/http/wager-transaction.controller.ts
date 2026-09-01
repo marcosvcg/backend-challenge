@@ -4,7 +4,7 @@ import { ProcessWagerTransactionUseCase } from '../../application/process-wager-
 import { instrumentProcessResult } from '../../application/instrument-process-result';
 import { WagerTransactionKind } from '../../domain/wager-transaction-kind';
 import { Money } from '../../../wallet/domain/money';
-import { canonicalPayloadHash } from '../../../shared/idempotency/canonical-payload-hash';
+import { hashCanonicalWagerPayload } from '../../application/canonical-wager-payload';
 import { SubmitWagerTransactionDto } from './submit-wager-transaction.dto';
 import { toSubmitWagerTransactionHttpResult } from './submit-wager-transaction.presenter';
 import type { MetricsPort } from '../../../shared/application/metrics';
@@ -34,9 +34,11 @@ export class WagerTransactionController {
 
     // payloadHash cobre exatamente o subconjunto de negócio do payload
     // (seção 9 do README) — nunca o header nem metadados de transporte.
-    // Mesma função canonicalPayloadHash já usada pelo fluxo SQS (nunca uma
-    // segunda implementação para HTTP).
-    const payloadHash = canonicalPayloadHash({
+    // Mesma função canonicalWagerPayload/hashCanonicalWagerPayload já usada
+    // pelo fluxo SQS (ARCHITECTURE.md, hardening SQS): garante que a mesma
+    // transação lógica produz o mesmo hash não importa por qual transporte
+    // chegou — nunca duas implementações "parecidas".
+    const payloadHash = hashCanonicalWagerPayload({
       providerId: dto.providerId,
       externalTransactionId: dto.externalTransactionId,
       playerId: dto.playerId,

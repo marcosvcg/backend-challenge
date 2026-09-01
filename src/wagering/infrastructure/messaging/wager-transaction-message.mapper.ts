@@ -2,14 +2,33 @@ import { WagerTransactionRequestedMessage } from './wager-transaction-requested.
 import { ProcessWagerTransactionCommand } from '../../application/process-wager-transaction.command';
 import { WagerTransactionKind } from '../../domain/wager-transaction-kind';
 import { Money } from '../../../wallet/domain/money';
-import { canonicalPayloadHash } from '../../../shared/idempotency/canonical-payload-hash';
+import { hashCanonicalWagerPayload } from '../../application/canonical-wager-payload';
 
 const CONSUMER_NAME = 'wagering-sqs-consumer';
 
-/** messageId como correlationId: correlaciona todos os eventos de saída
- *  gerados por este comando de entrada específico — a mensagem SQS não
- *  carrega um correlationId próprio (README seção 10). */
-export function wagerTransactionMessageToCommand(message: WagerTransactionRequestedMessage): ProcessWagerTransactionCommand {
+/** sqsMessageId: o Message.MessageId atribuído pelo próprio SQS à entrega —
+ *  NUNCA o `messageId` do body (campo controlado pelo produtor, sem
+ *  autoridade sobre deduplicação de transporte). Vira cmd.messageId, a
+ *  identidade persistida no Inbox (consumerName, messageId) — dedupe de
+ *  ENTREGA, distinta de idempotencyKey (identidade lógica/financeira,
+ *  comparada via payloadHash) e de correlationId (rastreabilidade de log,
+ *  aqui herdado do messageId do body só porque a mensagem em si não carrega
+ *  um correlationId de negócio próprio — README seção 10). Confundir os dois
+ *  IDs faria o Inbox deduplicar pela identidade "errada": duas entregas
+ *  distintas do SQS com o mesmo body.messageId (produtor bugado/hostil)
+ *  colapsariam indevidamente; ou pior, duas mensagens de fato diferentes que
+ *  por acaso compartilhassem um body.messageId jamais seriam processadas
+ *  como entregas distintas pelo Inbox.
+ *
+ *  payloadHash: hashCanonicalWagerPayload — MESMA função usada pelo
+ *  controller HTTP, nunca uma segunda implementação "parecida" (hardening
+ *  SQS: antes desta correção, o mapper hasheava `data` inteiro, incluindo
+ *  idempotencyKey, produzindo um hash diferente do HTTP para a mesma
+ *  transação lógica — cross-transport idempotency quebrada). */
+export function wagerTransactionMessageToCommand(
+  message: WagerTransactionRequestedMessage,
+  sqsMessageId: string,
+): ProcessWagerTransactionCommand {
   const { data } = message;
 
   return {
@@ -17,7 +36,19 @@ export function wagerTransactionMessageToCommand(message: WagerTransactionReques
     providerId: data.providerId,
     externalTransactionId: data.externalTransactionId,
     idempotencyKey: data.idempotencyKey,
-    payloadHash: canonicalPayloadHash(data as unknown as Record<string, unknown>),
+    payloadHash: hashCanonicalWagerPayload({
+      providerId: data.providerId,
+      externalTransactionId: data.externalTransactionId,
+      playerId: data.playerId,
+      walletId: data.walletId,
+      roundId: data.roundId,
+      gameId: data.gameId,
+      kind: data.kind,
+      money: { amount: data.money.amount, currency: data.money.currency },
+      ...(data.referenceExternalTransactionId !== undefined
+        ? { referenceExternalTransactionId: data.referenceExternalTransactionId }
+        : {}),
+    }),
     walletId: data.walletId,
     playerId: data.playerId,
     roundId: data.roundId,
@@ -27,7 +58,7 @@ export function wagerTransactionMessageToCommand(message: WagerTransactionReques
     ...(data.referenceExternalTransactionId !== undefined
       ? { referenceExternalTransactionId: data.referenceExternalTransactionId }
       : {}),
-    messageId: message.messageId,
+    messageId: sqsMessageId,
     consumerName: CONSUMER_NAME,
     correlationId: message.messageId,
   };

@@ -6,7 +6,9 @@ import { FailureCode } from './failure-code';
 import {
   IncompatibleReferenceError,
   InvalidReferenceKindError,
+  InvalidReferenceValueError,
   InvalidTransactionStateError,
+  InvalidWagerAmountError,
   MissingReferenceError,
   UnexpectedReferenceError,
 } from './wagering.errors';
@@ -75,9 +77,17 @@ export class WagerTransaction {
   ) {}
 
   /** Nasce sempre em PENDING. Valida a exigência de referência por kind
-   *  (REFUND/ROLLBACK exigem, WIN opcional, demais kinds proíbem — seção 7.1/7.2). */
+   *  (REFUND/ROLLBACK exigem, WIN opcional, demais kinds proíbem — seção 7.1/7.2)
+   *  e que o valor monetário é estritamente positivo — invariante de
+   *  WagerTransaction, não de Money (que precisa continuar aceitando zero/
+   *  negativo como value object genérico, ver InvalidWagerAmountError).
+   *  Aplica-se a OPENING também: CreateWalletUseCase só chama create() com
+   *  kind OPENING quando initialBalance > 0 (o caso initialBalance === 0
+   *  retorna antes, sem criar nenhuma WagerTransaction), então esta
+   *  invariante nunca quebra esse caminho — apenas o reforça. */
   static create(props: CreateWagerTransactionProps): WagerTransaction {
     WagerTransaction.assertReferenceRequirement(props.kind, props.referenceExternalTransactionId);
+    WagerTransaction.assertPositiveAmount(props.money);
 
     return new WagerTransaction(
       props.id,
@@ -281,16 +291,49 @@ export class WagerTransaction {
     }
   }
 
+  private static assertPositiveAmount(money: Money): void {
+    if (!money.isPositive()) {
+      throw new InvalidWagerAmountError(money.toJSON().amount);
+    }
+  }
+
+  /** Três semânticas deliberadamente separadas — nunca colapsadas numa única
+   *  checagem de "presente/ausente":
+   *
+   *  - required (REFUND/ROLLBACK): precisa de referência VÁLIDA.
+   *    undefined/''/whitespace → MissingReferenceError.
+   *  - forbidden (BET/LOSS): qualquer valor DEFINIDO é erro, válido ou não —
+   *    '' também é rejeitado aqui (não deveria ter sido enviado de jeito
+   *    nenhum). undefined → UnexpectedReferenceError.
+   *  - optional (WIN): undefined é permitido (nenhuma referência); se
+   *    definido, precisa ser válido. ''/whitespace definido →
+   *    InvalidReferenceValueError (distinto de Missing/Unexpected: WIN não
+   *    exige referência, então não é "faltou"; WIN pode legitimamente ter
+   *    referência, então não é "não pode existir").
+   *
+   *  Definida-mas-inválida (''/whitespace) NUNCA é tratada como "ausente" em
+   *  nenhum dos três casos — fecha a divergência real encontrada entre este
+   *  método (antes: `!== undefined`, contava '' como presente) e
+   *  ProcessWagerTransactionUseCase (antes: `if (truthy)`, tratava '' como
+   *  ausente e nunca resolvia a referência), que permitia um REFUND com
+   *  referência '' mover saldo sem a referência jamais ter sido validada
+   *  (hardening SQS). O parser SQS e a validação de borda HTTP continuam
+   *  barrando isso mais cedo — esta é a garantia final, no domínio, que não
+   *  depende de nenhum transporte específico. */
   private static assertReferenceRequirement(kind: WagerTransactionKind, referenceExternalTransactionId?: string): void {
-    const hasReference = referenceExternalTransactionId !== undefined;
+    const isPresent = referenceExternalTransactionId !== undefined;
+    const isValidReference = isPresent && referenceExternalTransactionId.trim().length > 0;
     const required = KINDS_REQUIRING_REFERENCE.has(kind);
     const optional = KINDS_ALLOWING_OPTIONAL_REFERENCE.has(kind);
 
-    if (required && !hasReference) {
+    if (required && !isValidReference) {
       throw new MissingReferenceError(kind);
     }
-    if (!required && !optional && hasReference) {
+    if (!required && !optional && isPresent) {
       throw new UnexpectedReferenceError(kind);
+    }
+    if (optional && isPresent && !isValidReference) {
+      throw new InvalidReferenceValueError(kind);
     }
   }
 }

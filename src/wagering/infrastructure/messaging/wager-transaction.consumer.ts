@@ -3,9 +3,33 @@ import { ProcessWagerTransactionUseCase } from '../../application/process-wager-
 import { instrumentProcessResult } from '../../application/instrument-process-result';
 import { parseWagerTransactionMessage, MalformedWagerTransactionMessageError } from './parse-wager-transaction-message';
 import { wagerTransactionMessageToCommand } from './wager-transaction-message.mapper';
+import { InvalidWagerAmountError, MissingReferenceError, UnexpectedReferenceError } from '../../domain/wagering.errors';
+import { InvalidMoneyAmountError, InvalidMoneyCurrencyError } from '../../../wallet/domain/money.errors';
 import { MetricsPort } from '../../../shared/application/metrics';
 import { Clock } from '../../../shared/application/clock';
 import { SQS_MESSAGE_REDELIVERIES_TOTAL } from '../../../shared/application/sqs-metrics';
+
+/** Erros estruturais/permanentes que podem vazar de fora do try/catch interno
+ *  de ResolveAndApplyWagerTransaction (que já converte InsufficientBalanceError/
+ *  IncompatibleReferenceError/InvalidReferenceKindError/DuplicateReversalError
+ *  em REJECTED — esses NUNCA chegam aqui). Os cinco abaixo só podem vir de
+ *  Money.from() (mapper, antes de useCase.execute()) ou de
+ *  WagerTransaction.create() (dentro do use case, mas fora do try/catch de
+ *  ResolveAndApplyWagerTransaction) — payload estruturalmente inválido, nunca
+ *  uma decisão de negócio. Mesmo padrão de type guard já usado em
+ *  ResolveAndApplyWagerTransaction.isKnownRejectionError — lista fechada e
+ *  pequena, sem introduzir uma classe-base nova para cinco erros. */
+const KNOWN_STRUCTURAL_ERRORS = [
+  InvalidMoneyAmountError,
+  InvalidMoneyCurrencyError,
+  InvalidWagerAmountError,
+  MissingReferenceError,
+  UnexpectedReferenceError,
+] as const;
+
+function isKnownStructuralError(err: unknown): err is Error {
+  return KNOWN_STRUCTURAL_ERRORS.some((ErrorClass) => err instanceof ErrorClass);
+}
 
 export interface WagerTransactionConsumerLogger {
   info(message: string, meta?: Record<string, unknown>): void;
@@ -109,6 +133,23 @@ export class WagerTransactionConsumer {
       return;
     }
 
+    // Message.MessageId (SDK AWS) é a identidade de ENTREGA/transporte — a
+    // única fonte legítima para o Inbox (consumerName, messageId). O SQS
+    // sempre atribui um MessageId real; o SDK só o tipa como opcional. Se
+    // vier ausente mesmo assim (comportamento inesperado do broker/SDK), não
+    // há identidade de transporte confiável para deduplicar — tratado como o
+    // mesmo caso de mensagem estruturalmente inaproveitável acima (early
+    // return, sem ACK, sujeito a redrive nativo), nunca mascarado inventando
+    // um UUID: um MessageId sintético romperia a garantia de que
+    // (consumerName, messageId) representa uma entrega real do SQS.
+    if (!message.MessageId) {
+      this.logger.error('Received message without a SQS MessageId — cannot establish transport identity for Inbox dedupe, skipping', {
+        sqsMessageId: message.MessageId,
+      });
+      return;
+    }
+    const sqsMessageId = message.MessageId;
+
     // receiveCount > 1 → esta entrega não é a primeira tentativa (o SQS já
     // redeliverou pelo menos uma vez) — um incremento por ENTREGA, não por
     // mensagem única (ARCHITECTURE.md seção 31). Puramente informativo:
@@ -121,7 +162,7 @@ export class WagerTransactionConsumer {
 
     try {
       const parsed = parseWagerTransactionMessage(message.Body);
-      const command = wagerTransactionMessageToCommand(parsed);
+      const command = wagerTransactionMessageToCommand(parsed, sqsMessageId);
       const startedAt = this.clock.now().getTime();
       const result = await this.useCase.execute(command);
       // Instrumentado AQUI, depois de execute() já ter resolvido — a
@@ -130,21 +171,21 @@ export class WagerTransactionConsumer {
       const durationSeconds = (this.clock.now().getTime() - startedAt) / 1000;
       instrumentProcessResult(result, 'queue', durationSeconds, this.metrics, this.logger, {
         correlationId: command.correlationId,
-        messageId: parsed.messageId,
+        messageId: sqsMessageId,
         providerId: command.providerId,
       });
 
       if (result.ackable) {
         await this.ack(receiptHandle);
         this.logger.info('Message processed and ACKed', {
-          messageId: parsed.messageId,
+          messageId: sqsMessageId,
           resultKind: result.kind,
         });
       } else {
         // permanent-error do próprio use case (ex.: INBOX_PAYLOAD_MISMATCH) —
         // não faz ACK, segue o caminho padrão de redrive/DLQ.
         this.logger.warn('Message classified as non-ackable by the use case — leaving for redrive/DLQ', {
-          messageId: parsed.messageId,
+          messageId: sqsMessageId,
           resultKind: result.kind,
           permanentErrorCode: result.permanentErrorCode,
         });
@@ -155,7 +196,24 @@ export class WagerTransactionConsumer {
         // redrive/DLQ que qualquer resultado não-ackable (ARCHITECTURE.md
         // seção 13: um único mecanismo de DLQ, sem publish manual).
         this.logger.error('Permanent parsing/schema error — leaving for redrive/DLQ', {
-          sqsMessageId: message.MessageId,
+          sqsMessageId,
+          error: err.message,
+        });
+        return;
+      }
+
+      if (isKnownStructuralError(err)) {
+        // permanent (estrutural, hardening SQS) — mesma classificação e mesmo
+        // caminho operacional do MalformedWagerTransactionMessageError acima.
+        // Money.from()/WagerTransaction.create() rejeitaram o payload ANTES
+        // de qualquer movimento de saldo (Money.from() roda no mapper, antes
+        // de useCase.execute(); WagerTransaction.create() roda dentro do use
+        // case, mas fora do try/catch que aplicaria débito/crédito) — nunca
+        // uma transação financeira parcial, nunca redelivery infinita
+        // disfarçada de erro transitório.
+        this.logger.error('Permanent domain validation error — leaving for redrive/DLQ', {
+          sqsMessageId,
+          errorName: err.name,
           error: err.message,
         });
         return;
@@ -165,7 +223,7 @@ export class WagerTransactionConsumer {
       // conexão, bug) — classificada como transient. Não faz ACK; visibility
       // timeout expira e a mensagem é reentregue.
       this.logger.error('Transient error processing message — leaving for redelivery', {
-        sqsMessageId: message.MessageId,
+        sqsMessageId,
         error: err instanceof Error ? err.message : String(err),
       });
     }

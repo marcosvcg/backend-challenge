@@ -183,3 +183,86 @@ describe('ProcessWagerTransactionUseCase — integration (real Postgres, real Mi
     expect(walletRow.balanceAmount).toBe('20.00'); // unchanged by the rejected refund — only the BET's debit applied
   });
 });
+
+/** cmd.messageId representa a identidade de ENTREGA/transporte (Message.MessageId
+ *  do SDK AWS, nunca um campo do body — hardening SQS, ARCHITECTURE.md). Estes
+ *  testes exercitam o Inbox diretamente via o use case (origin: 'queue' +
+ *  messageId/consumerName explícitos) contra Postgres real — não precisam de
+ *  SQS real no meio: o Inbox é responsabilidade do use case, testável
+ *  isoladamente da mecânica de entrega do transporte. */
+describe('ProcessWagerTransactionUseCase — Inbox transport dedupe vs. financial idempotency (real Postgres)', () => {
+  let orm: MikroORM;
+
+  beforeAll(async () => {
+    orm = await createTestOrm();
+  });
+
+  afterAll(async () => {
+    await orm.close();
+  });
+
+  beforeEach(async () => {
+    await truncateAllTables(orm);
+  });
+
+  function newUseCase(): ProcessWagerTransactionUseCase {
+    const runner = new MikroOrmTransactionRunner(orm.em);
+    return new ProcessWagerTransactionUseCase(runner, new UuidIdGenerator(), new FakeClock(AT), DEFAULT_REFERENCE_RETRY_POLICY);
+  }
+
+  function queueBetCommand(overrides: Partial<ProcessWagerTransactionCommand> = {}): ProcessWagerTransactionCommand {
+    return betCommand({
+      origin: 'queue',
+      consumerName: 'wagering-sqs-consumer',
+      messageId: 'sqs-message-id-1', // stands in for a real Message.MessageId from the SDK
+      correlationId: 'corr-queue-1',
+      ...overrides,
+    });
+  }
+
+  it('same AWS MessageId delivered again (already-acked): Inbox dedupe — no double debit, transaction processed only once', async () => {
+    await seedWallet(orm, '100.00');
+    const useCase = newUseCase();
+    const cmd = queueBetCommand();
+
+    const first = await useCase.execute(cmd);
+    expect(first.kind).toBe('processed');
+
+    // Redelivery of the EXACT same SQS message — same MessageId, same
+    // consumerName, same idempotencyKey/payloadHash. This is what the SQS
+    // broker actually does after a visibility timeout expires without ACK,
+    // or an at-least-once duplicate delivery.
+    const redelivery = await useCase.execute(cmd);
+    expect(redelivery.kind).toBe('already-acked'); // Inbox caught it — never re-entered the financial path
+
+    const walletRow = await orm.em.fork().findOneOrFail(WalletRow, { id: WALLET_ID });
+    expect(walletRow.balanceAmount).toBe('20.00'); // debited exactly once
+
+    const txCount = await orm.em.fork().count(WagerTransactionRow, {});
+    expect(txCount).toBe(1); // exactly one WagerTransaction row — replay never duplicated the ledger
+  });
+
+  it('two different AWS MessageIds with the same idempotencyKey: Inbox treats them as distinct deliveries, financial idempotency still prevents a duplicate effect', async () => {
+    await seedWallet(orm, '100.00');
+    const useCase = newUseCase();
+
+    // Two DIFFERENT SQS deliveries (different MessageId — as if the producer
+    // sent the same logical transaction twice, or a retry created a second
+    // real SQS message) carrying the SAME idempotencyKey/payloadHash. The
+    // Inbox alone would treat these as two unrelated deliveries (isNew: true
+    // both times, different messageId) — this proves the SEPARATE layer,
+    // idempotencyKey-based financial idempotency (use case step 2, after the
+    // Inbox claim), is what actually prevents the duplicate financial effect.
+    const first = await useCase.execute(queueBetCommand({ messageId: 'sqs-message-id-A' }));
+    expect(first.kind).toBe('processed');
+
+    const second = await useCase.execute(queueBetCommand({ messageId: 'sqs-message-id-B' }));
+    expect(second.kind).toBe('replay'); // NOT already-acked — the Inbox claim for message-id-B succeeded (isNew: true); it was idempotencyKey matching an existing WagerTransaction that caught this
+
+    const walletRow = await orm.em.fork().findOneOrFail(WalletRow, { id: WALLET_ID });
+    expect(walletRow.balanceAmount).toBe('20.00'); // debited exactly once, despite two distinct Inbox-claimed deliveries
+
+    const txCount = await orm.em.fork().count(WagerTransactionRow, {});
+    expect(txCount).toBe(1); // still exactly one WagerTransaction row
+  });
+});

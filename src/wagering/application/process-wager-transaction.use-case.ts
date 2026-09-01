@@ -79,9 +79,18 @@ export class ProcessWagerTransactionUseCase {
           ? { referenceExternalTransactionId: cmd.referenceExternalTransactionId }
           : {}),
       };
+      // WagerTransaction.create() (acima) já aplicou assertReferenceRequirement
+      // — qualquer referenceExternalTransactionId que chegou até aqui definido
+      // já passou pela invariante de domínio (string, trim().length > 0).
+      // Checagem por `!== undefined`, nunca truthiness: antes desta correção,
+      // `if (cmd.referenceExternalTransactionId)` tratava '' como ausente
+      // (falsy), divergindo de WagerTransaction.create() (que tratava '' como
+      // presente) — um REFUND com referência '' passava create() mas nunca
+      // tinha a referência resolvida aqui, aplicando o efeito de saldo sem
+      // validação (hardening SQS). Agora as duas checagens concordam sempre.
       const transaction = WagerTransaction.create(createProps);
 
-      if (cmd.referenceExternalTransactionId) {
+      if (cmd.referenceExternalTransactionId !== undefined) {
         referenceTransaction = await uow.wagerTransaction.findByProviderAndExternalId(
           cmd.providerId,
           cmd.referenceExternalTransactionId,

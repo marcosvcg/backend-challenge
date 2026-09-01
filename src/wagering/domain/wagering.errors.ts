@@ -9,6 +9,19 @@ export class InvalidTransactionStateError extends Error {
   }
 }
 
+/** Invariante de WagerTransaction, não de Money: Money é um value object
+ *  genérico e precisa continuar podendo representar zero/negativo (ex.:
+ *  resultBalance de uma wallet, ou o caso de teste que prova que
+ *  WalletLedgerEntry rejeita um lançamento com amount negativo). "uma
+ *  transação externa deve ter amount > 0" é regra específica do domínio de
+ *  wagering — vive aqui, não em Money.from(). */
+export class InvalidWagerAmountError extends Error {
+  constructor(amount: string) {
+    super(`Wager transaction amount must be strictly positive, got "${amount}".`);
+    this.name = 'InvalidWagerAmountError';
+  }
+}
+
 export class MissingReferenceError extends Error {
   constructor(kind: string) {
     super(`Transaction kind "${kind}" requires a referenceExternalTransactionId.`);
@@ -20,6 +33,19 @@ export class UnexpectedReferenceError extends Error {
   constructor(kind: string) {
     super(`Transaction kind "${kind}" must not carry a referenceExternalTransactionId.`);
     this.name = 'UnexpectedReferenceError';
+  }
+}
+
+/** Kinds de referência OPCIONAL (hoje só WIN): undefined é permitido
+ *  (nenhuma referência), mas se o campo foi fornecido, precisa ser uma
+ *  referência de verdade — nem MissingReferenceError ("faltou", não é o
+ *  caso: WIN nunca exige referência) nem UnexpectedReferenceError ("não pode
+ *  existir", também não é o caso: WIN pode legitimamente ter uma referência
+ *  válida) encaixam sem distorcer o significado. */
+export class InvalidReferenceValueError extends Error {
+  constructor(kind: string) {
+    super(`Transaction kind "${kind}" received a referenceExternalTransactionId that is blank — omit the field entirely if there is no reference.`);
+    this.name = 'InvalidReferenceValueError';
   }
 }
 
